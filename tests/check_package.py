@@ -124,8 +124,10 @@ class MockDb:
     """Records statements and answers the catalogue queries the macros issue."""
 
     def __init__(self, schema_exists=True, columns=None, objects=None,
-                 try_error_for=None, purge_count=3, watermark=None, missing_tables=None):
+                 try_error_for=None, purge_count=3, watermark=None, missing_tables=None,
+                 missing_columns=None, principals=None):
         self.statements: list[str] = []
+        self.catalog: list[str] = []  # readiness / principal lookups, kept apart from the work statements
         self.schema_exists = schema_exists
         self.columns = columns if columns is not None else {}
         self.objects = objects if objects is not None else []
@@ -133,17 +135,29 @@ class MockDb:
         self.purge_count = purge_count
         self.watermark = watermark
         self.missing_tables = missing_tables or []
+        self.missing_columns = missing_columns or {}
+        self.principals = principals if principals is not None else ["powerbi_readers", "PBI-Readers]x"]
 
     def run_query(self, sql):
         sql = str(sql)
-        self.statements.append(sql)
+        if "AS table_found" in sql or "FROM sys.database_principals" in sql:
+            self.catalog.append(sql)
+        else:
+            self.statements.append(sql)
         if "FROM sys.schemas WHERE name" in sql:
             return MockTable([[1 if self.schema_exists else 0]])
         if "JOIN sys.columns" in sql:
             return MockTable([[t, c] for t, cols in self.columns.items() for c in cols])
-        if "FROM sys.tables AS t" in sql and "AND t.name = N'" in sql:
+        if "AS table_found" in sql:
             name = sql.split("AND t.name = N'")[1].split("'")[0]
-            return MockTable([[0 if name in self.missing_tables else 1]])
+            in_list = sql.split("LOWER(c.name) IN (")[1].split(")")[0]
+            expected = in_list.count("N'")
+            if name in self.missing_tables:
+                return MockTable([[0, 0]])
+            return MockTable([[1, expected - len(self.missing_columns.get(name, []))]])
+        if "FROM sys.database_principals" in sql:
+            name = sql.split("name = N'")[1][:-1].replace("''", "'")
+            return MockTable([[1 if name in self.principals else 0]])
         if "FROM sys.objects" in sql:
             return MockTable([[o] for o in self.objects])
         if "CONVERT(nvarchar(30), MAX(" in sql:
@@ -332,7 +346,7 @@ def check_layout():
         R.ok((ROOT / f).exists(), f"exists: {f}")
     proj = (ROOT / "dbt_project.yml").read_text(encoding="utf-8")
     R.ok("name: dbt_sentinel" in proj, "dbt_project.yml name is dbt_sentinel")
-    R.ok('version: "0.2.1"' in proj, "dbt_project.yml version 0.2.1")
+    R.ok('version: "0.2.2"' in proj, "dbt_project.yml version 0.2.2")
     R.ok('macro-paths: ["macros"]' in proj, "macro-paths configured")
 
 
@@ -489,6 +503,9 @@ def scenarios(macros, verbose, dump_dir):
     rt = Runtime(macros, vars={"sentinel_view_reader_role": "bad\nrole"})
     expect_error("reader role validated", lambda: rt.call("sentinel_deploy_views"), "printable")
     R.ok(not any("DROP VIEW" in s for s in rt.db.statements), "invalid reader role fails before views are dropped")
+    rt = Runtime(macros, vars={"sentinel_view_reader_role": "powerbi_reader"})
+    expect_error("unknown reader role rejected", lambda: rt.call("sentinel_deploy_views"), "does not exist")
+    R.ok(not any("DROP VIEW" in s for s in rt.db.statements), "unknown reader role fails before views are dropped")
 
     # -- check
     objs = table_names + views
@@ -496,6 +513,9 @@ def scenarios(macros, verbose, dump_dir):
     rt.call("sentinel_check")
     R.ok(any("v_warehouse_waits" in l and l.startswith("[WARNING]") for l in rt.logs),
          "check: DMV permission failure is a logged warning")
+    R.ok(not any("telemetry write" in l for l in rt.logs), "check: probe failures are not labelled as telemetry writes")
+    R.ok(any(s.startswith("SET NOCOUNT") and "EXEC sp_executesql N'" in s for s in rt.db.statements),
+         "check: probes run through sp_executesql so binding errors are catchable")
     rt = Runtime(macros, db=MockDb(objects=[o for o in objs if o != "run_events"]))
     expect_error("check: missing table fails", lambda: rt.call("sentinel_check"), "run_events")
     rt = Runtime(macros, db=MockDb(objects=objs, try_error_for=["[v_run_history]"]))
@@ -517,9 +537,9 @@ def scenarios(macros, verbose, dump_dir):
     # -- start hook in warn mode wraps in TRY/CATCH
     rt = Runtime(macros)
     rt.call("sentinel_start_run")
-    R.ok("FROM sys.tables" in rt.db.statements[0] and "N'run_events'" in rt.db.statements[0],
-         "hook default mode checks the table exists first")
-    R.ok("BEGIN TRY" in rt.db.statements[1] and "BEGIN CATCH" in rt.db.statements[1],
+    R.ok(len(rt.db.catalog) == 1 and "N'run_events'" in rt.db.catalog[0] and "N'build_reason'" in rt.db.catalog[0],
+         "hook checks the table and all its columns first")
+    R.ok("BEGIN TRY" in rt.db.statements[0] and "BEGIN CATCH" in rt.db.statements[0],
          "hook default mode wraps writes in TRY/CATCH")
     rt = Runtime(macros, db=MockDb(try_error_for=["[run_events]"]))
     rt.call("sentinel_start_run")
@@ -535,6 +555,17 @@ def scenarios(macros, verbose, dump_dir):
          "hooks write nothing when Sentinel tables are missing")
     R.ok(any("not found" in l and "sentinel_install" in l for l in rt.logs), "missing table is logged with a fix")
     R.ok(rt.warnings == [], "missing table does not use exceptions.warn")
+
+    # -- Sentinel installed from an older version (missing new columns)
+    rt = Runtime(macros, db=MockDb(missing_columns={"run_events": ["build_reason"]}))
+    rt.call("sentinel_start_run")
+    R.ok(not any(s.startswith("SET NOCOUNT") or s.startswith("INSERT") for s in rt.db.statements),
+         "hooks write nothing when Sentinel tables lack new columns")
+    R.ok(any("missing 1 column" in l for l in rt.logs), "missing columns are logged with a fix")
+    rt = Runtime(macros, db=MockDb(missing_columns={"freshness_events": ["target_name"]}))
+    expect_error("operation fails clearly when columns are missing",
+                 lambda: rt.call("sentinel_record_freshness", source_id="x", status="pass"), "sentinel_install")
+    R.ok(not any(s.startswith("INSERT") for s in rt.db.statements), "no insert attempted against an outdated table")
 
     # -- failed node batch: completion event is not written
     rt = Runtime(macros, db=MockDb(try_error_for=["[node_results]"]),
@@ -744,6 +775,13 @@ def scenarios(macros, verbose, dump_dir):
          "purge deletes eight time-series tables")
     R.ok(not any("manifest" in d or "install_log" in d for d in deletes), "purge keeps manifest and install_log")
     rt = Runtime(macros)
+    rt.call("sentinel_purge_history", keep_days=180, prune_manifests=True)
+    mdel = [s for s in rt.db.statements if s.startswith("DELETE FROM [sentinel].[manifest")]
+    R.ok([d.split("]")[1] for d in mdel] == [".[manifest_edges", ".[manifest_nodes", ".[manifest_snapshots"],
+         "prune_manifests deletes edges, nodes, then headers")
+    R.ok(all("x.rn > 1" in d and "DATEADD(day, -180" in d for d in mdel), "prune_manifests keeps the latest snapshot")
+    keep("purge_manifests", rt)
+    rt = Runtime(macros)
     rt.call("sentinel_purge_history", keep_days=30, dry_run=True)
     R.ok(not any(s.startswith("DELETE") for s in rt.db.statements), "purge dry run deletes nothing")
     keep("purge", rt)
@@ -779,10 +817,33 @@ def scenarios(macros, verbose, dump_dir):
     R.ok("* 3.5" in rt.call("sentinel_view_sql", "v_duration_anomalies"), "slowdown factor rendered")
     R.ok(">= 45 THEN 'missing_completion'" in rt.call("sentinel_view_sql", "v_run_history"), "missing completion minutes rendered")
     hs = rt.call("sentinel_view_sql", "v_health_summary")
-    R.ok("(h.target_name = N'prod')" in hs, "summary target filter rendered")
+    R.ok("(r.target_name = N'prod')" in hs, "summary target filter rendered")
     R.ok(hs.index("THEN 'red'") < hs.index("THEN 'unknown'") and hs.index("THEN 'amber'") < hs.index("THEN 'unknown'"),
          "summary: alerts are evaluated before 'unknown'")
     R.ok("runs_total, 0) = 0 THEN 'unknown'" in hs, "summary: 'unknown' only when no run was ever recorded")
+    R.ok("f.freshness_state = 'not_checked' AND f.has_freshness_config = 1" in hs,
+         "summary: unchecked sources only count when they have a freshness policy")
+    R.ok(hs.count("[v_run_history]") == 1, "summary reads v_run_history once")
+    al = rt.call("sentinel_view_sql", "v_operational_alerts")
+    R.ok(al.count("[v_pipeline_health]") == 1, "alerts read v_pipeline_health once")
+    ph = rt.call("sentinel_view_sql", "v_pipeline_health")
+    R.ok(ph.count("[v_run_history]") == 1, "pipeline health reads v_run_history once")
+    th = rt.call("sentinel_view_sql", "v_table_health_history")
+    R.ok("PARTITION BY h.schema_name, h.table_name" in th, "table health is_latest is per table")
+    mi = rt.call("sentinel_view_sql", "v_model_inventory")
+    R.ok(mi.count("ls0.snapshot_id") >= 4, "inventory edge/test aggregations use only the latest snapshots")
+    rt = Runtime(macros, vars={"sentinel_query_exclude_logins": "svc_powerbi, etl_user",
+                               "sentinel_storage_exclude_schemas": "sentinel",
+                               "sentinel_tracked_commands": "build"})
+    R.ok("NOT IN (N'System', N'svc_powerbi', N'etl_user')" in rt.call("sentinel_view_sql", "v_user_queries"),
+         "string list var is split on commas, not characters")
+    rt.call("sentinel_sample_storage")
+    R.ok("NOT IN (N'sentinel')" in rt.db.statements[-1], "storage exclusion accepts a plain string")
+    rt = Runtime(macros, vars={"sentinel_tracked_commands": "build"}, which="run")
+    rt.call("sentinel_start_run")
+    R.ok(rt.db.statements == [], "tracked commands as a string: 'run' is not tracked when only 'build' is")
+    rt = Runtime(macros, vars={"sentinel_supported_adapters": "synapse_x"})
+    R.ok(rt.call("sentinel_is_supported_adapter") is False, "supported adapters string is not a substring match")
     rt_bad = Runtime(macros, vars={"sentinel_model_slowdown_factor": "2; DROP"})
     expect_error("view float var validated", lambda: rt_bad.call("sentinel_view_sql", "v_duration_anomalies"), "non-negative number")
 
@@ -810,6 +871,29 @@ def scenarios(macros, verbose, dump_dir):
         print(f"  rendered SQL written to {out}")
 
 
+def check_freshness_script():
+    print("\n[7] freshness_to_sentinel.py")
+    import importlib.util
+    import json as _json
+    spec = importlib.util.spec_from_file_location("f2s", ROOT / "scripts" / "freshness_to_sentinel.py")
+    f2s = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(f2s)
+    checks = [{"source_id": f"source.tdi.s.t{i}", "status": "runtime error", "message": "x\"y" * 500}
+              for i in range(60)]
+    chunks = f2s.chunk_checks(checks, 25, 6000)
+    R.ok(sum(len(c) for c in chunks) == 60, "chunking keeps every result")
+    R.ok(all(len(_json.dumps({"checks": c})) <= 6000 for c in chunks), "every chunk fits the size budget")
+    big = [{"source_id": "source.tdi.s.huge", "status": "runtime error", "message": "z" * 20000}]
+    R.ok(len(_json.dumps({"checks": f2s.chunk_checks(big, 25, 6000)[0]})) <= 6000, "oversized message is trimmed")
+    cmd = ["dbt", "run-operation", "x", "--args", '{"a": "it\'s"}']
+    out = f2s.format_command(cmd)
+    if f2s.os.name == "nt":
+        ok = out == f2s.subprocess.list2cmdline(cmd) and "--args '" not in out
+    else:
+        ok = f2s.shlex.split(out) == cmd
+    R.ok(ok, "printed command uses the platform's quoting and round-trips")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--verbose", action="store_true")
@@ -822,6 +906,7 @@ def main():
     rt = Runtime(macros)
     check_readme(macros, rt)
     scenarios(macros, args.verbose, args.dump_sql)
+    check_freshness_script()
 
     print(f"\n{R.passed} checks passed, {len(R.failures)} failed, {len(R.warnings)} warnings")
     sys.exit(1 if R.failures else 0)

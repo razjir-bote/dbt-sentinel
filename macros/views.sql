@@ -107,14 +107,22 @@ WHERE ls.rn = 1
 SELECT t.snapshot_id, t.attached_node AS node_id, t.unique_id AS test_id, t.test_type
 FROM {{ dbt_sentinel.sentinel_rel('manifest_nodes') }} AS t
 WHERE t.resource_type IN ('test', 'unit_test') AND t.attached_node IS NOT NULL
+  AND {{ dbt_sentinel.sentinel__in_latest_snapshot('t') }}
 UNION ALL
 SELECT e.snapshot_id, e.parent_id AS node_id, t.unique_id AS test_id, t.test_type
 FROM {{ dbt_sentinel.sentinel_rel('manifest_edges') }} AS e
 JOIN {{ dbt_sentinel.sentinel_rel('manifest_nodes') }} AS t
   ON t.snapshot_id = e.snapshot_id AND t.unique_id = e.child_id
 WHERE t.resource_type IN ('test', 'unit_test') AND t.attached_node IS NULL
+  AND {{ dbt_sentinel.sentinel__in_latest_snapshot('e') }}
   {%- endset -%}
   {{ return(sql) }}
+{%- endmacro %}
+
+{% macro sentinel__in_latest_snapshot(alias) -%}
+  {#- Restricts manifest rows to the latest snapshot per project x target, so
+      edge/test aggregations do not scan every historical snapshot. -#}
+  {{ return(alias ~ '.snapshot_id IN (SELECT ls0.snapshot_id FROM (\n' ~ dbt_sentinel.sentinel__latest_snapshots_sql() ~ '\n) AS ls0)') }}
 {%- endmacro %}
 
 {% macro sentinel__target_filter(alias) -%}
@@ -172,7 +180,7 @@ WHERE r.session_id <> SESSION_ID()
   {%- set capture = dbt_sentinel.sentinel_bool_var('sentinel_capture_query_text', false) -%}
   {%- set text_len = dbt_sentinel.sentinel_int_var('sentinel_query_text_max_length', 1000, 1) -%}
   {%- set excluded = ["N'System'"] -%}
-  {%- for l in var('sentinel_query_exclude_logins', []) -%}{%- do excluded.append(dbt_sentinel.sentinel_nstring(l)) -%}{%- endfor -%}
+  {%- for l in dbt_sentinel.sentinel_list_var('sentinel_query_exclude_logins', []) -%}{%- do excluded.append(dbt_sentinel.sentinel_nstring(l)) -%}{%- endfor -%}
   {%- set sql -%}
 SELECT
     c.request_id,
@@ -621,37 +629,37 @@ SELECT
     l.elapsed_seconds AS latest_elapsed_seconds,
     l.pipeline_run_id AS latest_pipeline_run_id,
     l.commit_id AS latest_commit_id,
-    a.last_success_at_utc,
-    a.last_completed_at_utc,
-    a.runs_24h,
-    a.failed_runs_24h,
-    a.missing_completions_24h,
-    CAST(DATEDIFF(minute, a.last_success_at_utc, SYSUTCDATETIME()) AS float) / 60.0 AS hours_since_last_success,
-    CASE WHEN a.last_success_at_utc IS NULL OR DATEDIFF(minute, a.last_success_at_utc, SYSUTCDATETIME()) > {{ stale_minutes }} THEN 1 ELSE 0 END AS is_stale,
+    l.last_success_at_utc,
+    l.last_completed_at_utc,
+    l.runs_24h,
+    l.failed_runs_24h,
+    l.missing_completions_24h,
+    CAST(DATEDIFF(minute, l.last_success_at_utc, SYSUTCDATETIME()) AS float) / 60.0 AS hours_since_last_success,
+    CASE WHEN l.last_success_at_utc IS NULL OR DATEDIFF(minute, l.last_success_at_utc, SYSUTCDATETIME()) > {{ stale_minutes }} THEN 1 ELSE 0 END AS is_stale,
     CASE
         WHEN l.run_status IN ('error', 'missing_completion') THEN 'unhealthy'
-        WHEN a.last_success_at_utc IS NULL OR DATEDIFF(minute, a.last_success_at_utc, SYSUTCDATETIME()) > {{ stale_minutes }} THEN 'stale'
+        WHEN l.last_success_at_utc IS NULL OR DATEDIFF(minute, l.last_success_at_utc, SYSUTCDATETIME()) > {{ stale_minutes }} THEN 'stale'
         WHEN l.run_status = 'warn' THEN 'warning'
         WHEN l.run_status = 'running' THEN 'running'
         ELSE 'healthy'
     END AS health_state
 FROM (
-    SELECT h.*, ROW_NUMBER() OVER (PARTITION BY h.project_name, h.target_name ORDER BY h.started_at_utc DESC) AS rn
+    {#- One pass over v_run_history: the latest row per project x target plus
+        windowed aggregates (v_run_history is itself a join of two sorts). -#}
+    SELECT h.*,
+        ROW_NUMBER() OVER (PARTITION BY h.project_name, h.target_name ORDER BY h.started_at_utc DESC) AS rn,
+        MAX(CASE WHEN h.run_status IN ('success', 'warn') THEN h.completed_at_utc END)
+            OVER (PARTITION BY h.project_name, h.target_name) AS last_success_at_utc,
+        MAX(h.completed_at_utc) OVER (PARTITION BY h.project_name, h.target_name) AS last_completed_at_utc,
+        SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) THEN 1 ELSE 0 END)
+            OVER (PARTITION BY h.project_name, h.target_name) AS runs_24h,
+        SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) AND h.is_failure = 1 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY h.project_name, h.target_name) AS failed_runs_24h,
+        SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) AND h.is_missing_completion = 1 THEN 1 ELSE 0 END)
+            OVER (PARTITION BY h.project_name, h.target_name) AS missing_completions_24h
     FROM {{ dbt_sentinel.sentinel_rel('v_run_history') }} AS h
+    WHERE h.project_name IS NOT NULL AND h.target_name IS NOT NULL
 ) AS l
-JOIN (
-    SELECT
-        h.project_name,
-        h.target_name,
-        MAX(CASE WHEN h.run_status IN ('success', 'warn') THEN h.completed_at_utc END) AS last_success_at_utc,
-        MAX(h.completed_at_utc) AS last_completed_at_utc,
-        SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) THEN 1 ELSE 0 END) AS runs_24h,
-        SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) AND h.is_failure = 1 THEN 1 ELSE 0 END) AS failed_runs_24h,
-        SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) AND h.is_missing_completion = 1 THEN 1 ELSE 0 END) AS missing_completions_24h
-    FROM {{ dbt_sentinel.sentinel_rel('v_run_history') }} AS h
-    GROUP BY h.project_name, h.target_name
-) AS a
-  ON a.project_name = l.project_name AND a.target_name = l.target_name
 WHERE l.rn = 1
   {%- endset -%}
   {{ return(sql) }}
@@ -797,6 +805,7 @@ JOIN (
 LEFT JOIN (
     SELECT e.snapshot_id, e.child_id, COUNT(*) AS upstream_count
     FROM {{ dbt_sentinel.sentinel_rel('manifest_edges') }} AS e
+    WHERE {{ dbt_sentinel.sentinel__in_latest_snapshot('e') }}
     GROUP BY e.snapshot_id, e.child_id
 ) AS up
   ON up.snapshot_id = m.snapshot_id AND up.child_id = m.unique_id
@@ -806,6 +815,7 @@ LEFT JOIN (
     JOIN {{ dbt_sentinel.sentinel_rel('manifest_nodes') }} AS c
       ON c.snapshot_id = e.snapshot_id AND c.unique_id = e.child_id
     WHERE c.resource_type NOT IN ('test', 'unit_test')
+      AND {{ dbt_sentinel.sentinel__in_latest_snapshot('e') }}
     GROUP BY e.snapshot_id, e.parent_id
 ) AS dn
   ON dn.snapshot_id = m.snapshot_id AND dn.parent_id = m.unique_id
@@ -971,6 +981,7 @@ LEFT JOIN (
     {#- A unit test has no attached_node; its model is its (single) parent. -#}
     SELECT e.snapshot_id, e.child_id, MIN(e.parent_id) AS parent_id
     FROM {{ dbt_sentinel.sentinel_rel('manifest_edges') }} AS e
+    WHERE {{ dbt_sentinel.sentinel__in_latest_snapshot('e') }}
     GROUP BY e.snapshot_id, e.child_id
 ) AS ue
   ON ti.resource_type = 'unit_test' AND ue.snapshot_id = ti.snapshot_id AND ue.child_id = ti.unique_id
@@ -1261,17 +1272,17 @@ FROM (
 
 {% macro sentinel_view_table_health_history() -%}
   {#- Daily table-health snapshots (sentinel_sample_table_health). No DMV
-      permission needed. is_latest marks each table's most recent sample. -#}
+      permission needed. is_latest marks each table's most recent sample, as
+      long as that sample is within 48 hours of the newest sample overall
+      (tolerates a missed daily sample; retires tables that were dropped). -#}
   {%- set sql -%}
 SELECT
     h.*,
     CAST(h.sampled_at_utc AS date) AS sample_date_utc,
-    CASE WHEN h.sampled_at_utc = m.latest_sampled_at_utc THEN 1 ELSE 0 END AS is_latest
+    CASE WHEN h.sampled_at_utc = MAX(h.sampled_at_utc) OVER (PARTITION BY h.schema_name, h.table_name)
+          AND h.sampled_at_utc >= DATEADD(hour, -48, MAX(h.sampled_at_utc) OVER ())
+         THEN 1 ELSE 0 END AS is_latest
 FROM {{ dbt_sentinel.sentinel_rel('table_health_samples') }} AS h
-CROSS JOIN (
-    SELECT MAX(x.sampled_at_utc) AS latest_sampled_at_utc
-    FROM {{ dbt_sentinel.sentinel_rel('table_health_samples') }} AS x
-) AS m
   {%- endset -%}
   {{ return(sql) }}
 {%- endmacro %}
@@ -1430,25 +1441,23 @@ FROM {{ dbt_sentinel.sentinel_rel('v_stage_health') }} AS sh
 WHERE sh.is_stale = 1 AND sh.latest_status NOT IN ('failed', 'cancelled')
 UNION ALL
 SELECT
-    CAST(CASE WHEN ph.latest_run_status = 'missing_completion' THEN 'run_missing_completion' ELSE 'run_failure' END AS nvarchar(64)),
-    CAST('high' AS nvarchar(16)),
+    {# Run failure (k = 1) and run staleness (k = 2) from one read of
+       v_pipeline_health. #}
+    CAST(CASE WHEN k.k = 2 THEN 'run_stale'
+              WHEN ph.latest_run_status = 'missing_completion' THEN 'run_missing_completion'
+              ELSE 'run_failure' END AS nvarchar(64)),
+    CAST(CASE WHEN k.k = 2 THEN 'medium' ELSE 'high' END AS nvarchar(16)),
     CAST(ph.project_name AS nvarchar(256)), CAST(ph.target_name AS nvarchar(128)),
-    CAST(ph.project_name + N' / ' + ph.target_name + N' / ' + COALESCE(ph.latest_command, N'') AS nvarchar(1024)),
-    CAST(N'Latest dbt invocation status: ' + ph.latest_run_status AS nvarchar(2000)),
+    CAST(CASE WHEN k.k = 2 THEN ph.project_name + N' / ' + ph.target_name
+              ELSE ph.project_name + N' / ' + ph.target_name + N' / ' + COALESCE(ph.latest_command, N'') END AS nvarchar(1024)),
+    CAST(CASE WHEN k.k = 2 THEN N'No successful dbt invocation since ' + COALESCE(CONVERT(nvarchar(30), ph.last_success_at_utc, 126), N'(never)')
+              ELSE N'Latest dbt invocation status: ' + ph.latest_run_status END AS nvarchar(2000)),
     CAST(ph.latest_started_at_utc AS datetime2(6)),
     CAST(ph.latest_invocation_id AS nvarchar(512))
 FROM {{ dbt_sentinel.sentinel_rel('v_pipeline_health') }} AS ph
-WHERE ph.latest_run_status IN ('error', 'missing_completion')
-UNION ALL
-SELECT
-    CAST('run_stale' AS nvarchar(64)), CAST('medium' AS nvarchar(16)),
-    CAST(ph.project_name AS nvarchar(256)), CAST(ph.target_name AS nvarchar(128)),
-    CAST(ph.project_name + N' / ' + ph.target_name AS nvarchar(1024)),
-    CAST(N'No successful dbt invocation since ' + COALESCE(CONVERT(nvarchar(30), ph.last_success_at_utc, 126), N'(never)') AS nvarchar(2000)),
-    CAST(ph.latest_started_at_utc AS datetime2(6)),
-    CAST(ph.latest_invocation_id AS nvarchar(512))
-FROM {{ dbt_sentinel.sentinel_rel('v_pipeline_health') }} AS ph
-WHERE ph.is_stale = 1
+CROSS JOIN (SELECT 1 AS k UNION ALL SELECT 2 AS k) AS k
+WHERE (k.k = 1 AND ph.latest_run_status IN ('error', 'missing_completion'))
+   OR (k.k = 2 AND ph.is_stale = 1)
 UNION ALL
 SELECT
     CAST('source_freshness' AS nvarchar(64)),
@@ -1528,9 +1537,9 @@ SELECT
     rs.failed_runs_24h,
     CAST(rs.successful_runs_24h AS float) / NULLIF(rs.finished_runs_24h, 0) AS success_rate_24h,
     rs.last_completed_at_utc,
-    lc.run_status AS last_completed_status,
-    lc.project_name AS last_completed_project,
-    lc.target_name AS last_completed_target,
+    rs.last_completed_status,
+    rs.last_completed_project,
+    rs.last_completed_target,
     COALESCE(al.high_alerts, 0) AS high_alerts,
     COALESCE(al.medium_alerts, 0) AS medium_alerts,
     COALESCE(al.low_alerts, 0) AS low_alerts,
@@ -1561,21 +1570,18 @@ FROM (
         SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) AND h.run_status <> 'running' THEN 1 ELSE 0 END) AS finished_runs_24h,
         SUM(CASE WHEN h.started_at_utc >= DATEADD(minute, -{{ stale_minutes }}, SYSUTCDATETIME()) THEN 1 ELSE 0 END) AS runs_in_stale_window,
         COUNT(*) AS runs_total,
-        MAX(h.completed_at_utc) AS last_completed_at_utc
-    FROM {{ dbt_sentinel.sentinel_rel('v_run_history') }} AS h
-    WHERE {{ dbt_sentinel.sentinel__target_filter('h') }}
-) AS rs
-LEFT JOIN (
-    SELECT z.run_status, z.project_name, z.target_name
+        MAX(h.completed_at_utc) AS last_completed_at_utc,
+        MAX(CASE WHEN h.completed_rn = 1 AND h.completed_at_utc IS NOT NULL THEN h.run_status END) AS last_completed_status,
+        MAX(CASE WHEN h.completed_rn = 1 AND h.completed_at_utc IS NOT NULL THEN h.project_name END) AS last_completed_project,
+        MAX(CASE WHEN h.completed_rn = 1 AND h.completed_at_utc IS NOT NULL THEN h.target_name END) AS last_completed_target
     FROM (
-        SELECT h.run_status, h.project_name, h.target_name,
-               ROW_NUMBER() OVER (ORDER BY h.completed_at_utc DESC) AS rn
-        FROM {{ dbt_sentinel.sentinel_rel('v_run_history') }} AS h
-        WHERE h.completed_at_utc IS NOT NULL AND {{ dbt_sentinel.sentinel__target_filter('h') }}
-    ) AS z
-    WHERE z.rn = 1
-) AS lc
-  ON 1 = 1
+        {#- One read of v_run_history for the counts and the last completed run. -#}
+        SELECT r.*,
+               ROW_NUMBER() OVER (ORDER BY CASE WHEN r.completed_at_utc IS NULL THEN 1 ELSE 0 END, r.completed_at_utc DESC) AS completed_rn
+        FROM {{ dbt_sentinel.sentinel_rel('v_run_history') }} AS r
+        WHERE {{ dbt_sentinel.sentinel__target_filter('r') }}
+    ) AS h
+) AS rs
 CROSS JOIN (
     SELECT
         SUM(CASE WHEN a.severity = 'high' THEN 1 ELSE 0 END) AS high_alerts,
@@ -1588,7 +1594,10 @@ CROSS JOIN (
 CROSS JOIN (
     SELECT
         SUM(CASE WHEN f.freshness_state IN ('error', 'runtime error') THEN 1 ELSE 0 END) AS sources_failing,
-        SUM(CASE WHEN f.freshness_state IN ('not_checked', 'check_stale') THEN 1 ELSE 0 END) AS sources_unchecked_or_stale,
+        {#- Same rule as the source_not_checked / source_check_stale alerts:
+            unchecked only counts for sources with a freshness policy. -#}
+        SUM(CASE WHEN (f.freshness_state = 'not_checked' AND f.has_freshness_config = 1)
+                   OR f.freshness_state = 'check_stale' THEN 1 ELSE 0 END) AS sources_unchecked_or_stale,
         MAX(f.last_checked_at_utc) AS last_check_utc
     FROM {{ dbt_sentinel.sentinel_rel('v_source_freshness') }} AS f
     WHERE f.target_name IS NULL OR {{ dbt_sentinel.sentinel__target_filter('f') }}

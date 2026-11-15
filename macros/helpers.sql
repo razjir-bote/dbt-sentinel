@@ -13,7 +13,7 @@
 -#}
 
 {% macro sentinel_version() -%}
-  {{ return('0.2.1') }}
+  {{ return('0.2.2') }}
 {%- endmacro %}
 
 {% macro sentinel_schema_version() -%}
@@ -76,6 +76,31 @@
   {{ exceptions.raise_compiler_error("dbt_sentinel: var '" ~ name ~ "' must be a boolean (true/false), got '" ~ raw ~ "'.") }}
 {%- endmacro %}
 
+{% macro sentinel_list_var(name, default) -%}
+  {#- A list of strings. A plain string (e.g. from env_var() or --vars
+      'x: a') is read as a comma-separated list, never character by character. -#}
+  {%- set raw = var(name, default) -%}
+  {%- if raw is none -%}{{ return([]) }}{%- endif -%}
+  {%- if raw is string -%}
+    {%- set out = [] -%}
+    {%- for part in raw.split(',') -%}
+      {%- if part | trim != '' -%}{%- do out.append(part | trim) -%}{%- endif -%}
+    {%- endfor -%}
+    {{ return(out) }}
+  {%- endif -%}
+  {%- if raw is mapping or raw is not iterable -%}
+    {{ exceptions.raise_compiler_error("dbt_sentinel: var '" ~ name ~ "' must be a list of strings (or a comma-separated string).") }}
+  {%- endif -%}
+  {%- set out = [] -%}
+  {%- for item in raw -%}
+    {%- if item is mapping or (item is iterable and item is not string) -%}
+      {{ exceptions.raise_compiler_error("dbt_sentinel: var '" ~ name ~ "' must contain only strings.") }}
+    {%- endif -%}
+    {%- do out.append(item | string | trim) -%}
+  {%- endfor -%}
+  {{ return(out) }}
+{%- endmacro %}
+
 {% macro sentinel_float_var(name, default) -%}
   {%- set raw = var(name, default) | string | trim -%}
   {%- if not modules.re.fullmatch('[0-9]+([.][0-9]+)?', raw) -%}
@@ -101,7 +126,7 @@
 {# ------------------------------------------------------- adapter / context #}
 
 {% macro sentinel_is_supported_adapter() -%}
-  {{ return(target.type in var('sentinel_supported_adapters', ['synapse'])) }}
+  {{ return(target.type in dbt_sentinel.sentinel_list_var('sentinel_supported_adapters', ['synapse'])) }}
 {%- endmacro %}
 
 {% macro sentinel_assert_adapter() -%}
@@ -136,7 +161,7 @@
     {% do dbt_sentinel.sentinel_warn("dbt_sentinel: hooks skipped - adapter '" ~ target.type ~ "' is not supported.") %}
     {{ return(false) }}
   {%- endif -%}
-  {%- set tracked = var('sentinel_tracked_commands', ['build', 'run', 'test', 'seed', 'snapshot']) -%}
+  {%- set tracked = dbt_sentinel.sentinel_list_var('sentinel_tracked_commands', ['build', 'run', 'test', 'seed', 'snapshot']) -%}
   {{ return(dbt_sentinel.sentinel_command() in tracked) }}
 {%- endmacro %}
 
@@ -253,15 +278,16 @@
 
 {# -------------------------------------------------------------- execution #}
 
-{% macro sentinel_execute(sql, on_error='fail') -%}
+{% macro sentinel_execute(sql, on_error='fail', label='telemetry write') -%}
   {#-
     Runs one batch. In 'warn' mode the statement is wrapped in TRY/CATCH and the
     error is returned as a result set, logged (see sentinel_warn) and swallowed,
-    so telemetry problems do not fail a production build. Object-name
-    resolution errors (e.g. Sentinel not installed) are compile errors in T-SQL
-    that TRY/CATCH cannot catch; sentinel_insert checks that its table exists
-    before writing in 'warn' mode. A lost connection still raises from
-    run_query, since Jinja has no exception handling.
+    so telemetry problems do not fail a production build. Object and column
+    name-resolution errors (Sentinel not installed, or installed from an older
+    version) are compile errors in T-SQL that TRY/CATCH cannot catch;
+    sentinel_insert checks the table and its columns before writing. A lost
+    connection still raises from run_query, since Jinja has no exception
+    handling.
   -#}
   {%- if on_error == 'fail' -%}
     {% do run_query(sql) %}
@@ -279,22 +305,46 @@ END CATCH
   {%- endset -%}
   {%- set res = run_query(wrapped) -%}
   {%- if res is not none and res.rows | length > 0 and (res.rows[0][0] | int) != 0 -%}
-    {% do dbt_sentinel.sentinel_warn("dbt_sentinel: telemetry write failed (error " ~ res.rows[0][0] ~ "): " ~ res.rows[0][1]) %}
+    {% do dbt_sentinel.sentinel_warn("dbt_sentinel: " ~ label ~ " failed (error " ~ res.rows[0][0] ~ "): " ~ res.rows[0][1]) %}
     {{ return(false) }}
   {%- endif -%}
   {{ return(true) }}
 {%- endmacro %}
 
-{% macro sentinel_table_exists(table_name) -%}
+{% macro sentinel_table_ready(table_name) -%}
+  {#- none when the table exists with every column this package version writes;
+      otherwise a short description of what is missing. -#}
+  {%- set names = [] -%}
+  {%- for c in dbt_sentinel.sentinel_table_columns()[table_name] -%}
+    {%- do names.append(dbt_sentinel.sentinel_nstring(c[0] | lower)) -%}
+  {%- endfor -%}
   {%- set sql -%}
-SELECT COUNT(*) AS n
-FROM sys.tables AS t
-JOIN sys.schemas AS s ON s.schema_id = t.schema_id
-WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) }}
-  AND t.name = {{ dbt_sentinel.sentinel_nstring(table_name) }}
+SELECT tf.n AS table_found, cf.n AS columns_found
+FROM (
+    SELECT COUNT(*) AS n
+    FROM sys.tables AS t
+    JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+    WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) }}
+      AND t.name = {{ dbt_sentinel.sentinel_nstring(table_name) }}
+) AS tf
+CROSS JOIN (
+    SELECT COUNT(*) AS n
+    FROM sys.columns AS c
+    JOIN sys.tables AS t ON t.object_id = c.object_id
+    JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+    WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) }}
+      AND t.name = {{ dbt_sentinel.sentinel_nstring(table_name) }}
+      AND LOWER(c.name) IN ({{ names | join(', ') }})
+) AS cf
   {%- endset -%}
   {%- set res = run_query(sql) -%}
-  {{ return(res is not none and res.rows | length > 0 and (res.rows[0][0] | int) > 0) }}
+  {%- if res is none or res.rows | length == 0 or (res.rows[0][0] | int) == 0 -%}
+    {{ return('table ' ~ dbt_sentinel.sentinel_rel(table_name) ~ ' not found') }}
+  {%- endif -%}
+  {%- if (res.rows[0][1] | int) < names | length -%}
+    {{ return('table ' ~ dbt_sentinel.sentinel_rel(table_name) ~ ' is missing ' ~ (names | length - (res.rows[0][1] | int)) ~ ' column(s) added in a newer dbt_sentinel version') }}
+  {%- endif -%}
+  {{ return(none) }}
 {%- endmacro %}
 
 {% macro sentinel_insert(table_name, rows, on_error='fail') -%}
@@ -302,11 +352,18 @@ WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) 
     Inserts a list of dicts into a Sentinel table in batches of
     var('sentinel_batch_size'). Missing keys become typed NULLs; unknown keys
     are ignored. Returns the number of rows submitted, or -1 if any batch
-    failed (warn mode) or the table is missing (warn mode; nothing is written).
+    failed or the table is not ready (warn mode; nothing is written). In
+    'fail' mode an unready table raises a clear error instead of a raw
+    'Invalid column name' from the database.
   -#}
-  {%- if on_error == 'warn' and not dbt_sentinel.sentinel_table_exists(table_name) -%}
-    {% do dbt_sentinel.sentinel_warn("dbt_sentinel: table " ~ dbt_sentinel.sentinel_rel(table_name) ~ " not found - telemetry skipped. Run 'dbt run-operation sentinel_install' for this target.") %}
-    {{ return(-1) }}
+  {%- set problem = dbt_sentinel.sentinel_table_ready(table_name) -%}
+  {%- if problem is not none -%}
+    {%- set msg = 'dbt_sentinel: ' ~ problem ~ ". Run 'dbt run-operation sentinel_install' for this target." -%}
+    {%- if on_error == 'warn' -%}
+      {% do dbt_sentinel.sentinel_warn(msg ~ ' Telemetry skipped.') %}
+      {{ return(-1) }}
+    {%- endif -%}
+    {{ exceptions.raise_compiler_error(msg) }}
   {%- endif -%}
   {%- set cols = dbt_sentinel.sentinel_table_columns()[table_name] -%}
   {%- set size = dbt_sentinel.sentinel_int_var('sentinel_batch_size', 35, 1) -%}

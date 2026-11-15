@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2 - 2026-11-15
+
+Fixes from a second code review. No table changes; run `dbt run-operation sentinel_deploy_views` (or `sentinel_install`) to pick up the view changes.
+
+- `sentinel_deploy_views` checks that `sentinel_view_reader_role` exists before dropping any view. A misspelled or not-yet-created role no longer leaves every view without its grants.
+- Writes check that the table has every column this package version expects, not just that it exists. After a package upgrade without `sentinel_install`, hooks skip with a log line instead of failing the build with an uncatchable "Invalid column name", and operations stop with a clear message.
+- `scripts/freshness_to_sentinel.py` splits calls by size as well as count (new `--max-args-chars`, default 6000), so long error messages can't exceed the Windows command-line limit. Launch errors are reported per call instead of crashing the script, and print mode now quotes commands for cmd.exe on Windows (POSIX shell elsewhere).
+- `v_health_summary.sources_unchecked_or_stale` only counts unchecked sources that have a freshness policy, matching the alert rules.
+- `sentinel_check` runs its probes through `sp_executesql`, so a view that no longer binds is reported as not queryable instead of aborting the check. Probe failures are no longer labelled "telemetry write failed".
+- `v_table_health_history.is_latest` marks each table's own latest sample (within 48 hours of the newest sample overall), so a table missing from one batch no longer drops out of maintenance alerts.
+- Manifest edge and test aggregations read only the latest snapshot per project × target. New `prune_manifests: true` option for `sentinel_purge_history` deletes superseded snapshots older than `keep_days`; the latest snapshot is always kept.
+- `v_pipeline_health`, `v_operational_alerts` and `v_health_summary` read run history once each instead of several times, cutting the cost of each dashboard refresh.
+- List vars (`sentinel_query_exclude_logins`, `sentinel_storage_exclude_schemas`, `sentinel_tracked_commands`, `sentinel_supported_adapters`) accept a comma-separated string. Before this fix, a plain string was read one character at a time.
+
 ## 0.2.1 - 2026-11-15
 
 Fixes from code review. Run `dbt run-operation sentinel_install` to add the new `freshness_events` columns and redeploy the views (schema version 3).
