@@ -45,7 +45,8 @@ vars:
   # --- deployment -----------------------------------------------------------
   # sentinel_table_index: HEAP           # or 'CLUSTERED COLUMNSTORE INDEX'
   # sentinel_schema_owner: <role/user>   # CREATE SCHEMA ... AUTHORIZATION
-  # sentinel_view_reader_role: powerbi_readers   # re-granted SELECT on every view deploy
+  # sentinel_view_reader_role: powerbi_readers   # re-granted SELECT on every view deploy;
+  #                                              # any principal name, e.g. 'PBI-Readers'
 
 on-run-start:
   - "{{ dbt_sentinel.sentinel_start_run() }}"

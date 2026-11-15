@@ -1,4 +1,4 @@
-# dbt Sentinel 0.2.0
+# dbt Sentinel 0.2.1
 
 A custom, framework-only dbt package for **dbt Core 1.12.6 + dbt-synapse on Azure Synapse Dedicated SQL Pool**. It installs a `sentinel` (configurable) schema containing low-volume telemetry tables and dashboard-ready SQL views. No business/source tables are modified.
 
@@ -18,7 +18,7 @@ Each release is built as `dist/dbt_sentinel-<version>.zip` (with a `.sha256` che
 
 3. `dbt deps`, then continue from step 3 of the quick start below.
 
-For Azure DevOps builds, either commit the unzipped folder to the host repository (e.g. `packages/dbt_sentinel` with `local: "packages/dbt_sentinel"`) or publish the package to a private Git repo and pin the tag (`git:` + `revision: "0.2.0"`). A path on your own machine is not visible to build agents.
+For Azure DevOps builds, either commit the unzipped folder to the host repository (e.g. `packages/dbt_sentinel` with `local: "packages/dbt_sentinel"`) or publish the package to a private Git repo and pin the tag (`git:` + `revision: "0.2.1"`). A path on your own machine is not visible to build agents.
 
 ## Quick start
 
@@ -33,7 +33,7 @@ The short path from zero to a working dashboard. Sections 1-7 below have the det
      - local: "C:/dbt-sentinel"        # local development (or a relative path)
      # Azure DevOps agents cannot see a local drive - use a private repo and pin a tag:
      # - git: "https://dev.azure.com/<org>/<project>/_git/dbt_sentinel"
-     #   revision: "0.2.0"
+     #   revision: "0.2.1"
    ```
 
 3. **Add hooks and vars** to the host `dbt_project.yml`, merged with what is already there (see `examples/dbt_project_fragment.yml` for every option, e.g. `sentinel_view_reader_role`, `sentinel_summary_target`):
@@ -142,7 +142,9 @@ on-run-end:
   - "{{ dbt_sentinel.sentinel_capture_run(results) }}"
 ```
 
-Passing `results` explicitly is recommended; `sentinel_capture_run()` with no argument falls back to the hook context's `results`. See `examples/dbt_project_fragment.yml` for every supported var. By default (`sentinel_hook_on_error: warn`) a telemetry write failure is logged as a dbt warning and does not fail the build; set it to `fail` to make telemetry mandatory.
+Passing `results` explicitly is recommended; `sentinel_capture_run()` with no argument falls back to the hook context's `results`. See `examples/dbt_project_fragment.yml` for every supported var. By default (`sentinel_hook_on_error: warn`) a telemetry write failure is logged as a `[WARNING]` line and does not fail the build; set it to `fail` to make telemetry mandatory. Warn mode also holds under `--warn-error` (Sentinel logs instead of raising a dbt warning) and on targets where Sentinel is not installed (the hooks check that their tables exist and skip with a log line). A lost database connection during the hook can still fail it, because dbt's Jinja cannot catch adapter exceptions. If node results cannot be fully written, the completion event is skipped, so the invocation shows as `missing_completion` instead of a complete run with missing nodes.
+
+Boolean vars (`sentinel_enabled`, `sentinel_capture_messages`, `sentinel_capture_query_text`, `sentinel_expose_command_text`, `sentinel_manifest_include_packages`) accept real booleans or the strings `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, so values from `env_var()` behave as expected; anything else is rejected.
 
 Execute from the host project's configured environment:
 
@@ -252,7 +254,7 @@ All timestamps are UTC. Stage and freshness emitters accept optional timestamps 
 | `v_model_inventory` | Node at latest manifest deployment | Documentation and ownership inventory |
 | `v_test_coverage` | Model/source | Tests attached to each node, has_owner |
 | `v_model_health` | Model × observed project/target | Last status, testing/ownership, runtime |
-| `v_test_failures` | Failed/warning test result | Recent test issues |
+| `v_test_failures` | Failed/warning test result | Recent test issues, including dbt unit tests |
 | `v_duration_anomalies` | Successful model execution | Current time vs mean of 10 previous observed executions |
 | `v_warehouse_requests` | Synapse recent query | Query queue/elapsed time, label, resource class |
 | `v_warehouse_waits` | Current wait record | Wait type/state and request ID |
@@ -268,7 +270,7 @@ All timestamps are UTC. Stage and freshness emitters accept optional timestamps 
 | `v_table_health` | User table | The three checks combined, issue count and recommended fix (live DMV) |
 | `v_table_health_history` | Table × sample | Daily table-health snapshots from `sentinel_sample_table_health` |
 | `v_table_growth` | Table × sampled time | Row deltas and approximate growth percentages |
-| `v_source_freshness` | Latest check per source | Last loaded time, status, age and threshold |
+| `v_source_freshness` | Latest check per source × target | Last loaded time, status, age and threshold |
 | `v_stage_health` | Latest pipeline/stage/source | Bronze/other stage health provided by orchestrator |
 | `v_operational_alerts` | One alert occurrence | Latest unhealthy stages, runs, sources; failed tests in 24h |
 

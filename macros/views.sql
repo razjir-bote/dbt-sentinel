@@ -100,17 +100,19 @@ WHERE ls.rn = 1
 
 {% macro sentinel__test_links_sql() -%}
   {#- (snapshot_id, node_id, test_id, test_type): a test is linked to its
-      attached_node when dbt recorded one, otherwise to each parent node. -#}
+      attached_node when dbt recorded one, otherwise to each parent node.
+      dbt unit tests ('unit_test', test_type 'unit') link to the model they
+      depend on. -#}
   {%- set sql -%}
 SELECT t.snapshot_id, t.attached_node AS node_id, t.unique_id AS test_id, t.test_type
 FROM {{ dbt_sentinel.sentinel_rel('manifest_nodes') }} AS t
-WHERE t.resource_type = 'test' AND t.attached_node IS NOT NULL
+WHERE t.resource_type IN ('test', 'unit_test') AND t.attached_node IS NOT NULL
 UNION ALL
 SELECT e.snapshot_id, e.parent_id AS node_id, t.unique_id AS test_id, t.test_type
 FROM {{ dbt_sentinel.sentinel_rel('manifest_edges') }} AS e
 JOIN {{ dbt_sentinel.sentinel_rel('manifest_nodes') }} AS t
   ON t.snapshot_id = e.snapshot_id AND t.unique_id = e.child_id
-WHERE t.resource_type = 'test' AND t.attached_node IS NULL
+WHERE t.resource_type IN ('test', 'unit_test') AND t.attached_node IS NULL
   {%- endset -%}
   {{ return(sql) }}
 {%- endmacro %}
@@ -167,7 +169,7 @@ WHERE r.session_id <> SESSION_ID()
       statement_type is the first keyword after any leading /* comment */ (such
       as dbt's query comment), so activity can be classified without storing
       SQL text. -#}
-  {%- set capture = var('sentinel_capture_query_text', false) -%}
+  {%- set capture = dbt_sentinel.sentinel_bool_var('sentinel_capture_query_text', false) -%}
   {%- set text_len = dbt_sentinel.sentinel_int_var('sentinel_query_text_max_length', 1000, 1) -%}
   {%- set excluded = ["N'System'"] -%}
   {%- for l in var('sentinel_query_exclude_logins', []) -%}{%- do excluded.append(dbt_sentinel.sentinel_nstring(l)) -%}{%- endfor -%}
@@ -803,7 +805,7 @@ LEFT JOIN (
     FROM {{ dbt_sentinel.sentinel_rel('manifest_edges') }} AS e
     JOIN {{ dbt_sentinel.sentinel_rel('manifest_nodes') }} AS c
       ON c.snapshot_id = e.snapshot_id AND c.unique_id = e.child_id
-    WHERE c.resource_type <> 'test'
+    WHERE c.resource_type NOT IN ('test', 'unit_test')
     GROUP BY e.snapshot_id, e.parent_id
 ) AS dn
   ON dn.snapshot_id = m.snapshot_id AND dn.parent_id = m.unique_id
@@ -840,7 +842,8 @@ SELECT
     COALESCE(c.accepted_values_tests, 0) AS accepted_values_tests,
     COALESCE(c.singular_tests, 0) AS singular_tests,
     COALESCE(c.other_generic_tests, 0) AS other_generic_tests,
-    CASE WHEN COALESCE(c.test_count, 0) > 0 THEN 1 ELSE 0 END AS has_tests
+    CASE WHEN COALESCE(c.test_count, 0) > 0 THEN 1 ELSE 0 END AS has_tests,
+    COALESCE(c.unit_tests, 0) AS unit_tests
 FROM {{ dbt_sentinel.sentinel_rel('v_model_inventory') }} AS i
 LEFT JOIN (
     SELECT
@@ -852,7 +855,8 @@ LEFT JOIN (
         SUM(CASE WHEN d.test_type = 'relationships' THEN 1 ELSE 0 END) AS relationships_tests,
         SUM(CASE WHEN d.test_type = 'accepted_values' THEN 1 ELSE 0 END) AS accepted_values_tests,
         SUM(CASE WHEN d.test_type = 'singular' THEN 1 ELSE 0 END) AS singular_tests,
-        SUM(CASE WHEN d.test_type NOT IN ('unique', 'not_null', 'relationships', 'accepted_values', 'singular') THEN 1 ELSE 0 END) AS other_generic_tests
+        SUM(CASE WHEN d.test_type NOT IN ('unique', 'not_null', 'relationships', 'accepted_values', 'singular', 'unit') THEN 1 ELSE 0 END) AS other_generic_tests,
+        SUM(CASE WHEN d.test_type = 'unit' THEN 1 ELSE 0 END) AS unit_tests
     FROM (
         SELECT DISTINCT k.snapshot_id, k.node_id, k.test_id, COALESCE(k.test_type, 'singular') AS test_type
         FROM (
@@ -955,17 +959,25 @@ SELECT
     h.command,
     h.pipeline_run_id,
     h.commit_id,
-    ti.test_type,
-    ti.attached_node AS tested_node_id,
+    COALESCE(ti.test_type, CASE WHEN h.resource_type = 'unit_test' THEN 'unit' END) AS test_type,
+    COALESCE(ti.attached_node, ue.parent_id) AS tested_node_id,
     tn.node_name AS tested_node_name,
     tn.resource_type AS tested_resource_type,
     tn.owner_name AS tested_node_owner
 FROM {{ dbt_sentinel.sentinel_rel('v_node_history') }} AS h
 LEFT JOIN {{ dbt_sentinel.sentinel_rel('v_model_inventory') }} AS ti
   ON ti.project_name = h.project_name AND ti.target_name = h.target_name AND ti.unique_id = h.unique_id
+LEFT JOIN (
+    {#- A unit test has no attached_node; its model is its (single) parent. -#}
+    SELECT e.snapshot_id, e.child_id, MIN(e.parent_id) AS parent_id
+    FROM {{ dbt_sentinel.sentinel_rel('manifest_edges') }} AS e
+    GROUP BY e.snapshot_id, e.child_id
+) AS ue
+  ON ti.resource_type = 'unit_test' AND ue.snapshot_id = ti.snapshot_id AND ue.child_id = ti.unique_id
 LEFT JOIN {{ dbt_sentinel.sentinel_rel('v_model_inventory') }} AS tn
-  ON tn.project_name = ti.project_name AND tn.target_name = ti.target_name AND tn.unique_id = ti.attached_node
-WHERE h.resource_type = 'test'
+  ON tn.project_name = ti.project_name AND tn.target_name = ti.target_name
+ AND tn.unique_id = COALESCE(ti.attached_node, ue.parent_id)
+WHERE h.resource_type IN ('test', 'unit_test')
   AND h.status IN ('fail', 'error', 'warn')
   AND h.observed_at_utc >= DATEADD(day, -{{ days }}, SYSUTCDATETIME())
   {%- endset -%}
@@ -1032,7 +1044,7 @@ FROM (
 {%- endmacro %}
 
 {% macro sentinel_view_warehouse_requests() -%}
-  {%- set expose = var('sentinel_expose_command_text', false) -%}
+  {%- set expose = dbt_sentinel.sentinel_bool_var('sentinel_expose_command_text', false) -%}
   {%- set sql -%}
 SELECT
     r.request_id,
@@ -1303,8 +1315,8 @@ FROM (
   {%- set sql -%}
 SELECT
     COALESCE(f.source_id, src.unique_id) AS source_id,
-    src.project_name,
-    src.target_name,
+    COALESCE(src.project_name, f.project_name) AS project_name,
+    COALESCE(src.target_name, f.target_name) AS target_name,
     src.source_name,
     src.node_name AS table_name,
     src.owner_name,
@@ -1326,8 +1338,11 @@ SELECT
 FROM (
     SELECT x.*
     FROM (
-        SELECT fe.*, ROW_NUMBER() OVER (PARTITION BY fe.source_id ORDER BY fe.checked_at_utc DESC, fe.recorded_at_utc DESC) AS rn
+        {#- Latest check per source and target. Rows recorded before 0.2.1 have
+            no target, cannot be attributed, and are ignored. -#}
+        SELECT fe.*, ROW_NUMBER() OVER (PARTITION BY fe.source_id, fe.target_name ORDER BY fe.checked_at_utc DESC, fe.recorded_at_utc DESC) AS rn
         FROM {{ dbt_sentinel.sentinel_rel('freshness_events') }} AS fe
+        WHERE fe.target_name IS NOT NULL
     ) AS x
     WHERE x.rn = 1
 ) AS f
@@ -1336,7 +1351,7 @@ FULL OUTER JOIN (
     FROM {{ dbt_sentinel.sentinel_rel('v_model_inventory') }} AS i
     WHERE i.resource_type = 'source'
 ) AS src
-  ON src.unique_id = f.source_id
+  ON src.unique_id = f.source_id AND src.target_name = f.target_name
   {%- endset -%}
   {{ return(sql) }}
 {%- endmacro %}
@@ -1499,10 +1514,13 @@ WHERE nh.resource_type IN ('model', 'seed', 'snapshot')
   {%- set sql -%}
 SELECT
     SYSUTCDATETIME() AS evaluated_at_utc,
+    {#- Alerts first: a stopped scheduler raises run_stale (medium) and must not
+        hide behind 'unknown'. 'unknown' means no dbt run was ever recorded. -#}
     CASE
-        WHEN COALESCE(rs.runs_in_stale_window, 0) = 0 THEN 'unknown'
         WHEN COALESCE(al.high_alerts, 0) > 0 THEN 'red'
         WHEN COALESCE(al.medium_alerts, 0) > 0 THEN 'amber'
+        WHEN COALESCE(rs.runs_total, 0) = 0 THEN 'unknown'
+        WHEN COALESCE(rs.runs_in_stale_window, 0) = 0 THEN 'amber'
         ELSE 'green'
     END AS overall_state,
     rs.runs_24h,
@@ -1542,6 +1560,7 @@ FROM (
         SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) AND h.is_failure = 1 THEN 1 ELSE 0 END) AS failed_runs_24h,
         SUM(CASE WHEN h.started_at_utc >= DATEADD(hour, -24, SYSUTCDATETIME()) AND h.run_status <> 'running' THEN 1 ELSE 0 END) AS finished_runs_24h,
         SUM(CASE WHEN h.started_at_utc >= DATEADD(minute, -{{ stale_minutes }}, SYSUTCDATETIME()) THEN 1 ELSE 0 END) AS runs_in_stale_window,
+        COUNT(*) AS runs_total,
         MAX(h.completed_at_utc) AS last_completed_at_utc
     FROM {{ dbt_sentinel.sentinel_rel('v_run_history') }} AS h
     WHERE {{ dbt_sentinel.sentinel__target_filter('h') }}

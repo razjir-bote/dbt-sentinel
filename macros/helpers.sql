@@ -13,12 +13,12 @@
 -#}
 
 {% macro sentinel_version() -%}
-  {{ return('0.2.0') }}
+  {{ return('0.2.1') }}
 {%- endmacro %}
 
 {% macro sentinel_schema_version() -%}
   {#- Bump when table definitions change; recorded in install_log. -#}
-  {{ return(2) }}
+  {{ return(3) }}
 {%- endmacro %}
 
 
@@ -30,6 +30,17 @@
     {{ exceptions.raise_compiler_error("dbt_sentinel: " ~ what ~ " '" ~ s ~ "' must be a simple identifier (letters, digits and underscores, not starting with a digit).") }}
   {%- endif -%}
   {{ return(s) }}
+{%- endmacro %}
+
+{% macro sentinel_quote_name(value, what='principal') -%}
+  {#- Bracket-quotes a database principal name (role, user or Entra ID group such
+      as 'PBI-Readers' or 'svc_pbi@contoso.com'). Any printable name up to 128
+      characters is accepted; ']' is escaped. -#}
+  {%- set s = (value | string | trim) if value is not none else '' -%}
+  {%- if s == '' or s | length > 128 or not s.isprintable() -%}
+    {{ exceptions.raise_compiler_error("dbt_sentinel: " ~ what ~ " '" ~ s ~ "' must be a non-empty name of at most 128 printable characters.") }}
+  {%- endif -%}
+  {{ return('[' ~ s.replace(']', ']]') ~ ']') }}
 {%- endmacro %}
 
 {% macro sentinel_schema() -%}
@@ -51,6 +62,18 @@
     {{ exceptions.raise_compiler_error("dbt_sentinel: var '" ~ name ~ "' must be >= " ~ minimum ~ ", got " ~ v ~ ".") }}
   {%- endif -%}
   {{ return(v) }}
+{%- endmacro %}
+
+{% macro sentinel_bool_var(name, default) -%}
+  {#- Booleans from env_var() or quoted --vars arrive as strings; 'false' must
+      mean false. Accepts true/false, 1/0, yes/no, y/n, on/off (any case). -#}
+  {%- set raw = var(name, default) -%}
+  {%- if raw is sameas true or raw is sameas false -%}{{ return(raw) }}{%- endif -%}
+  {%- if raw is none -%}{{ return(false) }}{%- endif -%}
+  {%- set s = raw | string | lower | trim -%}
+  {%- if s in ['true', '1', 'yes', 'y', 'on'] -%}{{ return(true) }}{%- endif -%}
+  {%- if s in ['false', '0', 'no', 'n', 'off', '', 'none', 'null'] -%}{{ return(false) }}{%- endif -%}
+  {{ exceptions.raise_compiler_error("dbt_sentinel: var '" ~ name ~ "' must be a boolean (true/false), got '" ~ raw ~ "'.") }}
 {%- endmacro %}
 
 {% macro sentinel_float_var(name, default) -%}
@@ -98,12 +121,19 @@
   {{ return((which | string | lower) if which is not none else 'unknown') }}
 {%- endmacro %}
 
+{% macro sentinel_warn(message) -%}
+  {#- Non-fatal notice. Deliberately not exceptions.warn: under --warn-error /
+      --warn-error-options dbt promotes that to an error, which would let a
+      swallowed telemetry problem fail the host build. -#}
+  {% do log('[WARNING] ' ~ message, info=true) %}
+{%- endmacro %}
+
 {% macro sentinel_hooks_active() -%}
-  {%- if not execute or not var('sentinel_enabled', true) -%}
+  {%- if not execute or not dbt_sentinel.sentinel_bool_var('sentinel_enabled', true) -%}
     {{ return(false) }}
   {%- endif -%}
   {%- if not dbt_sentinel.sentinel_is_supported_adapter() -%}
-    {% do exceptions.warn("dbt_sentinel: hooks skipped - adapter '" ~ target.type ~ "' is not supported.") %}
+    {% do dbt_sentinel.sentinel_warn("dbt_sentinel: hooks skipped - adapter '" ~ target.type ~ "' is not supported.") %}
     {{ return(false) }}
   {%- endif -%}
   {%- set tracked = var('sentinel_tracked_commands', ['build', 'run', 'test', 'seed', 'snapshot']) -%}
@@ -226,10 +256,12 @@
 {% macro sentinel_execute(sql, on_error='fail') -%}
   {#-
     Runs one batch. In 'warn' mode the statement is wrapped in TRY/CATCH and the
-    error is returned as a result set, logged as a dbt warning, and swallowed,
-    so telemetry problems do not fail a production build. Note: object-name
+    error is returned as a result set, logged (see sentinel_warn) and swallowed,
+    so telemetry problems do not fail a production build. Object-name
     resolution errors (e.g. Sentinel not installed) are compile errors in T-SQL
-    and are not catchable; install before enabling hooks.
+    that TRY/CATCH cannot catch; sentinel_insert checks that its table exists
+    before writing in 'warn' mode. A lost connection still raises from
+    run_query, since Jinja has no exception handling.
   -#}
   {%- if on_error == 'fail' -%}
     {% do run_query(sql) %}
@@ -247,18 +279,35 @@ END CATCH
   {%- endset -%}
   {%- set res = run_query(wrapped) -%}
   {%- if res is not none and res.rows | length > 0 and (res.rows[0][0] | int) != 0 -%}
-    {% do exceptions.warn("dbt_sentinel: telemetry write failed (error " ~ res.rows[0][0] ~ "): " ~ res.rows[0][1]) %}
+    {% do dbt_sentinel.sentinel_warn("dbt_sentinel: telemetry write failed (error " ~ res.rows[0][0] ~ "): " ~ res.rows[0][1]) %}
     {{ return(false) }}
   {%- endif -%}
   {{ return(true) }}
+{%- endmacro %}
+
+{% macro sentinel_table_exists(table_name) -%}
+  {%- set sql -%}
+SELECT COUNT(*) AS n
+FROM sys.tables AS t
+JOIN sys.schemas AS s ON s.schema_id = t.schema_id
+WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) }}
+  AND t.name = {{ dbt_sentinel.sentinel_nstring(table_name) }}
+  {%- endset -%}
+  {%- set res = run_query(sql) -%}
+  {{ return(res is not none and res.rows | length > 0 and (res.rows[0][0] | int) > 0) }}
 {%- endmacro %}
 
 {% macro sentinel_insert(table_name, rows, on_error='fail') -%}
   {#-
     Inserts a list of dicts into a Sentinel table in batches of
     var('sentinel_batch_size'). Missing keys become typed NULLs; unknown keys
-    are ignored. Returns the number of rows submitted.
+    are ignored. Returns the number of rows submitted, or -1 if any batch
+    failed (warn mode) or the table is missing (warn mode; nothing is written).
   -#}
+  {%- if on_error == 'warn' and not dbt_sentinel.sentinel_table_exists(table_name) -%}
+    {% do dbt_sentinel.sentinel_warn("dbt_sentinel: table " ~ dbt_sentinel.sentinel_rel(table_name) ~ " not found - telemetry skipped. Run 'dbt run-operation sentinel_install' for this target.") %}
+    {{ return(-1) }}
+  {%- endif -%}
   {%- set cols = dbt_sentinel.sentinel_table_columns()[table_name] -%}
   {%- set size = dbt_sentinel.sentinel_int_var('sentinel_batch_size', 35, 1) -%}
   {%- set col_list = [] -%}
