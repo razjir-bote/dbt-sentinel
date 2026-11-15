@@ -6,6 +6,8 @@
 # Principles:
 #   * The dbt step's exit code is authoritative for the job result.
 #   * Telemetry steps use continueOnError so they can never mask or replace it.
+#   * Every Sentinel step passes the same --target as dbt build, so telemetry
+#     lands in the same pool as the run it describes.
 #   * The finaliser runs under always(), so a failed or cancelled job is still
 #     recorded even when dbt never reached its on-run-end hook.
 
@@ -23,6 +25,7 @@ steps:
   - script: >
       dbt run-operation sentinel_record_stage --args
       "{pipeline_name: '$(Build.DefinitionName)', pipeline_run_id: '$(Build.BuildId)', stage: 'silver_gold', status: 'running'}"
+      --target prod
     displayName: Sentinel - stage started
     continueOnError: true
 
@@ -35,7 +38,7 @@ steps:
     condition: succeededOrFailed()
     continueOnError: true
 
-  - script: python dbt_packages/dbt_sentinel/scripts/freshness_to_sentinel.py target/sources.json --execute
+  - script: python dbt_packages/dbt_sentinel/scripts/freshness_to_sentinel.py target/sources.json --execute --target prod
     displayName: Sentinel - record source freshness
     condition: succeededOrFailed()
     continueOnError: true
@@ -45,6 +48,7 @@ steps:
   - script: >
       dbt run-operation sentinel_record_stage --args
       "{pipeline_name: '$(Build.DefinitionName)', pipeline_run_id: '$(Build.BuildId)', stage: 'silver_gold', status: '$(Agent.JobStatus)'}"
+      --target prod
     displayName: Sentinel - stage finaliser
     condition: always()
     continueOnError: true

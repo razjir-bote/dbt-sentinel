@@ -14,7 +14,8 @@
 
   Hook macros run their own statements and return an empty string, which dbt
   skips. With var sentinel_hook_on_error = 'warn' (default) a telemetry write
-  failure is logged as a warning and does not fail the build.
+  failure (or a target where Sentinel is not installed) is logged and does not
+  fail the build, including under --warn-error.
 -#}
 
 
@@ -90,7 +91,7 @@
     {%- set rs = [] -%}
   {%- endif -%}
 
-  {%- set capture_messages = var('sentinel_capture_messages', true) -%}
+  {%- set capture_messages = dbt_sentinel.sentinel_bool_var('sentinel_capture_messages', true) -%}
   {%- set message_len = dbt_sentinel.sentinel_int_var('sentinel_message_max_length', 1000, 0) -%}
   {%- set ns = namespace(success=0, error=0, fail=0, warn=0, skipped=0) -%}
   {%- set rows = [] -%}
@@ -148,7 +149,14 @@
   {%- endfor -%}
 
   {%- if rows | length > 0 -%}
-    {% do dbt_sentinel.sentinel_insert('node_results', rows, mode) %}
+    {%- set written = dbt_sentinel.sentinel_insert('node_results', rows, mode) -%}
+    {%- if written == -1 -%}
+      {#- Without its node rows a completed run would look complete but lose
+          nodes from every node-level view; leave it without a completion
+          event so it surfaces as missing_completion instead. -#}
+      {% do dbt_sentinel.sentinel_warn('dbt_sentinel: node results for invocation ' ~ invocation_id ~ ' were not fully written; completion event skipped (the run will show as missing_completion).') %}
+      {{ return('') }}
+    {%- endif -%}
   {%- endif -%}
 
   {#- The completion event is written last so that a completed invocation always
@@ -193,6 +201,8 @@
   {%- if rtype == 'test' -%}
     {%- set tm = node.get('test_metadata') -%}
     {%- set test_type = (tm.get('name') if tm else none) or 'singular' -%}
+  {%- elif rtype == 'unit_test' -%}
+    {%- set test_type = 'unit' -%}
   {%- endif -%}
   {%- set has_freshness = false -%}
   {%- set loaded_at_field = none -%}
@@ -229,7 +239,7 @@
 {% macro sentinel_sync_manifest() -%}
   {%- if not execute -%}{{ return('') }}{%- endif -%}
   {{ dbt_sentinel.sentinel_assert_adapter() }}
-  {%- set include_packages = var('sentinel_manifest_include_packages', false) -%}
+  {%- set include_packages = dbt_sentinel.sentinel_bool_var('sentinel_manifest_include_packages', false) -%}
   {%- set types = ['model', 'test', 'seed', 'snapshot'] -%}
   {%- set snapshot_id = invocation_id -%}
   {%- set node_rows = [] -%}
@@ -243,6 +253,16 @@
       {%- endfor -%}
     {%- endif -%}
   {%- endfor -%}
+  {#- dbt unit tests (dbt >= 1.8) live outside graph.nodes; their depends_on
+      edges link them to the model under test. -#}
+  {%- for ut in (graph.get('unit_tests') or {}).values() -%}
+    {%- if include_packages or ut.get('package_name') == project_name -%}
+      {%- do node_rows.append(dbt_sentinel.sentinel__node_row(snapshot_id, ut)) -%}
+      {%- for parent in ((ut.get('depends_on') or {}).get('nodes') or []) | unique -%}
+        {%- do edge_rows.append({'snapshot_id': snapshot_id, 'parent_id': parent, 'child_id': ut.get('unique_id')}) -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endfor -%}
   {%- for src in graph.sources.values() -%}
     {%- if include_packages or src.get('package_name') == project_name -%}
       {%- do node_rows.append(dbt_sentinel.sentinel__node_row(snapshot_id, src)) -%}
@@ -250,10 +270,14 @@
   {%- endfor -%}
 
   {%- set mode = dbt_sentinel.sentinel_on_error_mode('operation') -%}
-  {% do dbt_sentinel.sentinel_insert('manifest_nodes', node_rows, mode) %}
-  {% do dbt_sentinel.sentinel_insert('manifest_edges', edge_rows, mode) %}
+  {%- set nodes_written = dbt_sentinel.sentinel_insert('manifest_nodes', node_rows, mode) -%}
+  {%- set edges_written = dbt_sentinel.sentinel_insert('manifest_edges', edge_rows, mode) -%}
   {#- Snapshot header last: views only read snapshots whose header exists, so a
       partially loaded snapshot is never shown as the latest deployment. -#}
+  {%- if nodes_written == -1 or edges_written == -1 -%}
+    {% do dbt_sentinel.sentinel_warn('dbt_sentinel: manifest snapshot ' ~ snapshot_id ~ ' was not fully written; header skipped, the previous snapshot stays current. Re-run sentinel_sync_manifest.') %}
+    {{ return('') }}
+  {%- endif -%}
   {%- set p = dbt_sentinel.sentinel_pipeline_context() -%}
   {% do dbt_sentinel.sentinel_insert('manifest_snapshots', [{
       'snapshot_id': snapshot_id,
@@ -361,7 +385,9 @@ SELECT
 FROM (
 {{ dbt_sentinel.sentinel__requests_select(finished_only=true) }}
 ) AS q
-{% if wm %}WHERE q.end_time_utc > CAST(N'{{ dbt_sentinel.sentinel_timestamp_text(wm) }}' AS datetime2(3)){% endif %}
+{# end_time is datetime (1/300 s ticks) but is stored as datetime2(3); compare
+   at the stored precision so the boundary request is not copied again. #}
+{% if wm %}WHERE CAST(q.end_time_utc AS datetime2(3)) > CAST(N'{{ dbt_sentinel.sentinel_timestamp_text(wm) }}' AS datetime2(3)){% endif %}
   {%- endset -%}
   {% do dbt_sentinel.sentinel_execute(sql, dbt_sentinel.sentinel_on_error_mode('operation')) %}
   {% do log('dbt_sentinel: query sample stored (requests finished after ' ~ (wm if wm else 'the start of DMV retention') ~ ')', info=true) %}
@@ -443,6 +469,8 @@ FROM (
       'checked_at_utc': check.get('checked_at') or dbt_sentinel.sentinel_sql('SYSUTCDATETIME()'),
       'message': check.get('message'),
       'pipeline_run_id': run_id,
+      'project_name': project_name,
+      'target_name': target.name,
       'recorded_at_utc': dbt_sentinel.sentinel_sql('SYSUTCDATETIME()')
   }) }}
 {%- endmacro %}

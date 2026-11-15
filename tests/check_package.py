@@ -124,7 +124,7 @@ class MockDb:
     """Records statements and answers the catalogue queries the macros issue."""
 
     def __init__(self, schema_exists=True, columns=None, objects=None,
-                 try_error_for=None, purge_count=3, watermark=None):
+                 try_error_for=None, purge_count=3, watermark=None, missing_tables=None):
         self.statements: list[str] = []
         self.schema_exists = schema_exists
         self.columns = columns if columns is not None else {}
@@ -132,6 +132,7 @@ class MockDb:
         self.try_error_for = try_error_for or []
         self.purge_count = purge_count
         self.watermark = watermark
+        self.missing_tables = missing_tables or []
 
     def run_query(self, sql):
         sql = str(sql)
@@ -140,6 +141,9 @@ class MockDb:
             return MockTable([[1 if self.schema_exists else 0]])
         if "JOIN sys.columns" in sql:
             return MockTable([[t, c] for t, cols in self.columns.items() for c in cols])
+        if "FROM sys.tables AS t" in sql and "AND t.name = N'" in sql:
+            name = sql.split("AND t.name = N'")[1].split("'")[0]
+            return MockTable([[0 if name in self.missing_tables else 1]])
         if "FROM sys.objects" in sql:
             return MockTable([[o] for o in self.objects])
         if "CONVERT(nvarchar(30), MAX(" in sql:
@@ -328,7 +332,7 @@ def check_layout():
         R.ok((ROOT / f).exists(), f"exists: {f}")
     proj = (ROOT / "dbt_project.yml").read_text(encoding="utf-8")
     R.ok("name: dbt_sentinel" in proj, "dbt_project.yml name is dbt_sentinel")
-    R.ok('version: "0.2.0"' in proj, "dbt_project.yml version 0.2.0")
+    R.ok('version: "0.2.1"' in proj, "dbt_project.yml version 0.2.1")
     R.ok('macro-paths: ["macros"]' in proj, "macro-paths configured")
 
 
@@ -478,11 +482,20 @@ def scenarios(macros, verbose, dump_dir):
     R.ok(sum(s.startswith("GRANT SELECT") for s in stmts) == 28, "redeploy: reapplies view grants when configured")
     keep("install_redeploy", rt)
 
+    # -- reader role: Entra ID style names are quoted; bad names fail before any DROP
+    rt = Runtime(macros, vars={"sentinel_view_reader_role": "PBI-Readers]x"})
+    rt.call("sentinel_deploy_views")
+    R.ok(any(s.endswith("TO [PBI-Readers]]x]") for s in rt.db.statements), "reader role bracket-quoted and escaped")
+    rt = Runtime(macros, vars={"sentinel_view_reader_role": "bad\nrole"})
+    expect_error("reader role validated", lambda: rt.call("sentinel_deploy_views"), "printable")
+    R.ok(not any("DROP VIEW" in s for s in rt.db.statements), "invalid reader role fails before views are dropped")
+
     # -- check
     objs = table_names + views
     rt = Runtime(macros, db=MockDb(objects=objs, try_error_for=["[v_warehouse_waits]"]))
     rt.call("sentinel_check")
-    R.ok(any("v_warehouse_waits" in w for w in rt.warnings), "check: DMV permission failure is a warning")
+    R.ok(any("v_warehouse_waits" in l and l.startswith("[WARNING]") for l in rt.logs),
+         "check: DMV permission failure is a logged warning")
     rt = Runtime(macros, db=MockDb(objects=[o for o in objs if o != "run_events"]))
     expect_error("check: missing table fails", lambda: rt.call("sentinel_check"), "run_events")
     rt = Runtime(macros, db=MockDb(objects=objs, try_error_for=["[v_run_history]"]))
@@ -504,11 +517,44 @@ def scenarios(macros, verbose, dump_dir):
     # -- start hook in warn mode wraps in TRY/CATCH
     rt = Runtime(macros)
     rt.call("sentinel_start_run")
-    R.ok("BEGIN TRY" in rt.db.statements[0] and "BEGIN CATCH" in rt.db.statements[0],
+    R.ok("FROM sys.tables" in rt.db.statements[0] and "N'run_events'" in rt.db.statements[0],
+         "hook default mode checks the table exists first")
+    R.ok("BEGIN TRY" in rt.db.statements[1] and "BEGIN CATCH" in rt.db.statements[1],
          "hook default mode wraps writes in TRY/CATCH")
     rt = Runtime(macros, db=MockDb(try_error_for=["[run_events]"]))
     rt.call("sentinel_start_run")
-    R.ok(any("telemetry write failed" in w for w in rt.warnings), "hook write error becomes a warning")
+    R.ok(any("telemetry write failed" in l for l in rt.logs), "hook write error is logged")
+    R.ok(rt.warnings == [], "hook write error never uses exceptions.warn (safe under --warn-error)")
+
+    # -- Sentinel not installed in this target: warn mode skips, never raises
+    rt = Runtime(macros, db=MockDb(missing_tables=["run_events", "node_results"]),
+                 results=[make_result("model.tdi.a", "model", "success")])
+    rt.call("sentinel_start_run")
+    rt.call("sentinel_capture_run")
+    R.ok(not any(s.startswith("SET NOCOUNT") or s.startswith("INSERT") for s in rt.db.statements),
+         "hooks write nothing when Sentinel tables are missing")
+    R.ok(any("not found" in l and "sentinel_install" in l for l in rt.logs), "missing table is logged with a fix")
+    R.ok(rt.warnings == [], "missing table does not use exceptions.warn")
+
+    # -- failed node batch: completion event is not written
+    rt = Runtime(macros, db=MockDb(try_error_for=["[node_results]"]),
+                 results=[make_result("model.tdi.a", "model", "success")])
+    rt.call("sentinel_capture_run")
+    R.ok(not any("[run_events]" in s for s in rt.db.statements), "failed node batch skips the completion event")
+    R.ok(any("completion event skipped" in l for l in rt.logs), "skipped completion is logged")
+
+    # -- boolean vars given as strings (env_var / quoted --vars)
+    for raw in ["false", "False", "0", "no"]:
+        rt = Runtime(macros, vars={"sentinel_enabled": raw})
+        rt.call("sentinel_start_run")
+        R.ok(rt.db.statements == [], f"sentinel_enabled={raw!r} disables hooks")
+    rt = Runtime(macros, vars={"sentinel_capture_query_text": "false", "sentinel_expose_command_text": "false"})
+    R.ok("LEFT(r.command" not in rt.call("sentinel_view_sql", "v_user_queries"), "capture_query_text='false' stores no SQL")
+    R.ok("LEFT(r.command" not in rt.call("sentinel_view_sql", "v_warehouse_requests"), "expose_command_text='false' shows no SQL")
+    rt = Runtime(macros, vars={"sentinel_capture_query_text": "true"})
+    R.ok("LEFT(r.command" in rt.call("sentinel_view_sql", "v_user_queries"), "capture_query_text='true' enables capture")
+    rt_bad = Runtime(macros, vars={"sentinel_capture_query_text": "maybe"})
+    expect_error("boolean var validated", lambda: rt_bad.call("sentinel_view_sql", "v_user_queries"), "must be a boolean")
 
     # -- hooks skipped for compile, docs, disabled, other adapters, parse time
     for label, kw in [("compile", {"which": "compile"}), ("docs", {"which": "generate"}),
@@ -552,7 +598,7 @@ def scenarios(macros, verbose, dump_dir):
     rt.call("sentinel_capture_run", run_results=[make_result("seed.tdi.s", "seed", "success", materialized="seed")])
     R.ok("seed.tdi.s" in rt.db.statements[0] and "model.tdi.a" not in rt.db.statements[0],
          "end hook prefers explicitly passed results")
-    rt = Runtime(macros, vars={"sentinel_hook_on_error": "fail", "sentinel_capture_messages": False},
+    rt = Runtime(macros, vars={"sentinel_hook_on_error": "fail", "sentinel_capture_messages": "false"},
                  results=[make_result("model.tdi.a", "model", "error", message="secret-ish text")])
     rt.call("sentinel_capture_run")
     R.ok("secret-ish" not in rt.db.statements[0], "sentinel_capture_messages=false drops messages")
@@ -577,6 +623,34 @@ def scenarios(macros, verbose, dump_dir):
     rt = Runtime(macros, graph=make_graph(), vars={"sentinel_manifest_include_packages": True})
     rt.call("sentinel_sync_manifest")
     R.ok("pkg_model" in rt.db.statements[0], "manifest: package nodes included when configured")
+    rt = Runtime(macros, graph=make_graph(), vars={"sentinel_manifest_include_packages": "false"})
+    rt.call("sentinel_sync_manifest")
+    R.ok("pkg_model" not in rt.db.statements[0], "manifest: include_packages='false' is false")
+
+    # -- unit tests (dbt >= 1.8) are synced and linked to their model
+    g = make_graph()
+    g["unit_tests"] = {"unit_test.tdi.fct_trade.test_sign": {
+        "unique_id": "unit_test.tdi.fct_trade.test_sign", "resource_type": "unit_test", "name": "test_sign",
+        "package_name": "tdi", "database": "tdi_dw", "schema": "silver", "description": "", "tags": [],
+        "config": {}, "original_file_path": "models/fct_trade.yml", "model": "fct_trade",
+        "depends_on": {"nodes": ["model.tdi.fct_trade"]}}}
+    rt = Runtime(macros, graph=g)
+    rt.call("sentinel_sync_manifest")
+    R.ok("N'unit_test.tdi.fct_trade.test_sign'" in rt.db.statements[0] and "N'unit'" in rt.db.statements[0],
+         "manifest: unit tests stored with test_type 'unit'")
+    R.ok("N'unit_test.tdi.fct_trade.test_sign'" in rt.db.statements[1], "manifest: unit test edge to its model")
+    keep("sync_manifest_unit_tests", rt)
+    rt = Runtime(macros)
+    R.ok("h.resource_type IN ('test', 'unit_test')" in rt.call("sentinel_view_sql", "v_test_failures"),
+         "v_test_failures includes unit tests")
+    R.ok("t.resource_type IN ('test', 'unit_test')" in rt.call("sentinel_view_sql", "v_model_health"),
+         "v_model_health counts failing unit tests")
+
+    # -- partial manifest load: header is not written
+    rt = Runtime(macros, graph=make_graph(), vars={"sentinel_operation_on_error": "warn"},
+                 db=MockDb(try_error_for=["[manifest_edges]"]))
+    rt.call("sentinel_sync_manifest")
+    R.ok(not any("[manifest_snapshots]" in s for s in rt.db.statements), "manifest: failed batch skips snapshot header")
 
     # -- samplers
     rt = Runtime(macros, vars={"sentinel_storage_exclude_schemas": ["sentinel", "staging"]})
@@ -621,7 +695,8 @@ def scenarios(macros, verbose, dump_dir):
                        "sentinel_query_exclude_logins": ["svc_powerbi", "o'brien"]})
     rt.call("sentinel_sample_requests")
     ins = rt.db.statements[-1]
-    R.ok("q.end_time_utc > CAST(N'2026-11-15 06:00:01.123' AS datetime2(3))" in ins, "query sampler is incremental on end time")
+    R.ok("CAST(q.end_time_utc AS datetime2(3)) > CAST(N'2026-11-15 06:00:01.123' AS datetime2(3))" in ins,
+         "query sampler is incremental on end time at stored precision")
     R.ok("LEFT(r.command, 300)" in ins, "query text captured (truncated) when enabled")
     R.ok("NOT IN (N'System', N'svc_powerbi', N'o''brien')" in ins, "login exclusions applied and escaped")
     keep("sample_requests_incremental", rt)
@@ -654,6 +729,11 @@ def scenarios(macros, verbose, dump_dir):
     R.ok("N'pass'" in rt.db.statements[0] and "CAST(45 AS float)" in rt.db.statements[0], "freshness row")
     R.ok(rt.db.statements[1].count("UNION ALL") == 1 and "N'runtime error'" in rt.db.statements[1],
          "freshness batch: one insert, statuses normalised")
+    R.ok("CAST(N'prod' AS nvarchar(128))" in rt.db.statements[0] and "CAST(N'tdi' AS nvarchar(256))" in rt.db.statements[0],
+         "freshness rows record project and target")
+    sf = rt.call("sentinel_view_sql", "v_source_freshness")
+    R.ok("PARTITION BY fe.source_id, fe.target_name" in sf and "src.target_name = f.target_name" in sf,
+         "v_source_freshness is per target")
     keep("freshness", rt)
 
     # -- purge
@@ -698,7 +778,11 @@ def scenarios(macros, verbose, dump_dir):
                                "sentinel_summary_target": "prod"})
     R.ok("* 3.5" in rt.call("sentinel_view_sql", "v_duration_anomalies"), "slowdown factor rendered")
     R.ok(">= 45 THEN 'missing_completion'" in rt.call("sentinel_view_sql", "v_run_history"), "missing completion minutes rendered")
-    R.ok("(h.target_name = N'prod')" in rt.call("sentinel_view_sql", "v_health_summary"), "summary target filter rendered")
+    hs = rt.call("sentinel_view_sql", "v_health_summary")
+    R.ok("(h.target_name = N'prod')" in hs, "summary target filter rendered")
+    R.ok(hs.index("THEN 'red'") < hs.index("THEN 'unknown'") and hs.index("THEN 'amber'") < hs.index("THEN 'unknown'"),
+         "summary: alerts are evaluated before 'unknown'")
+    R.ok("runs_total, 0) = 0 THEN 'unknown'" in hs, "summary: 'unknown' only when no run was ever recorded")
     rt_bad = Runtime(macros, vars={"sentinel_model_slowdown_factor": "2; DROP"})
     expect_error("view float var validated", lambda: rt_bad.call("sentinel_view_sql", "v_duration_anomalies"), "non-negative number")
 

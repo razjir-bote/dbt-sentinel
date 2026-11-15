@@ -197,7 +197,9 @@
       ['checked_at_utc', 'datetime2(6)', false],
       ['message', 'nvarchar(2000)', true],
       ['pipeline_run_id', 'nvarchar(128)', true],
-      ['recorded_at_utc', 'datetime2(6)', false]
+      ['recorded_at_utc', 'datetime2(6)', false],
+      ['project_name', 'nvarchar(256)', true],
+      ['target_name', 'nvarchar(128)', true]
     ]
   }) }}
 {%- endmacro %}
@@ -251,7 +253,7 @@ WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) 
   {%- set res = run_query('SELECT COUNT(*) AS n FROM sys.schemas WHERE name = ' ~ dbt_sentinel.sentinel_nstring(schema)) -%}
   {%- if (res.rows[0][0] | int) == 0 -%}
     {%- set auth = var('sentinel_schema_owner', none) -%}
-    {% do run_query('CREATE SCHEMA [' ~ schema ~ ']' ~ ((' AUTHORIZATION [' ~ dbt_sentinel.sentinel_identifier(auth, 'sentinel_schema_owner') ~ ']') if auth else '')) %}
+    {% do run_query('CREATE SCHEMA [' ~ schema ~ ']' ~ ((' AUTHORIZATION ' ~ dbt_sentinel.sentinel_quote_name(auth, 'sentinel_schema_owner')) if auth else '')) %}
     {% do log('dbt_sentinel: created schema [' ~ schema ~ ']', info=true) %}
   {%- endif -%}
 
@@ -294,20 +296,25 @@ WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) 
   {%- if not execute -%}{{ return('') }}{%- endif -%}
   {{ dbt_sentinel.sentinel_assert_adapter() }}
   {%- set names = dbt_sentinel.sentinel_view_names() -%}
+  {#- Validate configuration and render every view before anything is dropped,
+      so a bad var cannot leave the views missing or without their grants. -#}
+  {%- set grantee = var('sentinel_view_reader_role', none) -%}
+  {%- set grantee_sql = dbt_sentinel.sentinel_quote_name(grantee, 'sentinel_view_reader_role') if grantee else none -%}
+  {%- set view_sql = {} -%}
+  {%- for v in names -%}{%- do view_sql.update({v: dbt_sentinel.sentinel_view_sql(v)}) -%}{%- endfor -%}
   {#- Drop in reverse dependency order, create in dependency order. -#}
   {%- for v in names | reverse -%}
     {% do run_query("IF OBJECT_ID(N'" ~ dbt_sentinel.sentinel_rel(v) ~ "', N'V') IS NOT NULL DROP VIEW " ~ dbt_sentinel.sentinel_rel(v)) %}
   {%- endfor -%}
   {%- for v in names -%}
-    {% do run_query('CREATE VIEW ' ~ dbt_sentinel.sentinel_rel(v) ~ ' AS\n' ~ dbt_sentinel.sentinel_view_sql(v)) %}
+    {% do run_query('CREATE VIEW ' ~ dbt_sentinel.sentinel_rel(v) ~ ' AS\n' ~ view_sql[v]) %}
   {%- endfor -%}
-  {%- set grantee = var('sentinel_view_reader_role', none) -%}
-  {%- if grantee -%}
+  {%- if grantee_sql -%}
     {%- for v in names -%}
-      {% do run_query('GRANT SELECT ON ' ~ dbt_sentinel.sentinel_rel(v) ~ ' TO [' ~ dbt_sentinel.sentinel_identifier(grantee, 'sentinel_view_reader_role') ~ ']') %}
+      {% do run_query('GRANT SELECT ON ' ~ dbt_sentinel.sentinel_rel(v) ~ ' TO ' ~ grantee_sql) %}
     {%- endfor -%}
   {%- endif -%}
-  {% do log('dbt_sentinel: deployed ' ~ names | length ~ ' views' ~ ((' and granted SELECT to [' ~ grantee ~ ']') if grantee else ''), info=true) %}
+  {% do log('dbt_sentinel: deployed ' ~ names | length ~ ' views' ~ ((' and granted SELECT to ' ~ grantee_sql) if grantee_sql else ''), info=true) %}
 {%- endmacro %}
 
 {% macro sentinel_check(include_dmv_views=true) -%}
@@ -354,7 +361,7 @@ WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) 
   {%- endfor -%}
 
   {%- if ns.warned | length > 0 -%}
-    {% do exceptions.warn('dbt_sentinel check: DMV views not queryable by this identity (needs VIEW DATABASE STATE): ' ~ ns.warned | join(', ')) %}
+    {% do dbt_sentinel.sentinel_warn('dbt_sentinel check: DMV views not queryable by this identity (needs VIEW DATABASE STATE): ' ~ ns.warned | join(', ')) %}
   {%- endif -%}
   {%- if ns.missing | length > 0 or ns.failed | length > 0 -%}
     {{ exceptions.raise_compiler_error('dbt_sentinel check FAILED. Missing: [' ~ ns.missing | join(', ') ~ '] Not queryable: [' ~ ns.failed | join(', ') ~ ']. Run sentinel_install.') }}
