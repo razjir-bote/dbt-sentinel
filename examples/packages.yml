@@ -5,4 +5,4 @@ packages:
 
   # Or a private Git repository (pin a tag for production):
   # - git: "https://dev.azure.com/<org>/<project>/_git/dbt_sentinel"
-  #   revision: "0.2.1"
+  #   revision: "0.2.2"

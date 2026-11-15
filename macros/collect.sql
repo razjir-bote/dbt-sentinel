@@ -317,7 +317,7 @@ FROM (
 {% macro sentinel_sample_storage() -%}
   {%- if not execute -%}{{ return('') }}{%- endif -%}
   {{ dbt_sentinel.sentinel_assert_adapter() }}
-  {%- set excluded = var('sentinel_storage_exclude_schemas', []) -%}
+  {%- set excluded = dbt_sentinel.sentinel_list_var('sentinel_storage_exclude_schemas', []) -%}
   {%- set excluded_lits = [] -%}
   {%- for s in excluded -%}{%- do excluded_lits.append(dbt_sentinel.sentinel_nstring(s)) -%}{%- endfor -%}
   {%- set sql -%}
@@ -504,9 +504,12 @@ FROM (
 
 {# =================================================================== purge #}
 
-{% macro sentinel_purge_history(keep_days=180, dry_run=false) -%}
+{% macro sentinel_purge_history(keep_days=180, dry_run=false, prune_manifests=false) -%}
   {#- Deletes time-series telemetry older than keep_days. Manifest snapshots,
-      nodes, edges and install_log are deployment/audit metadata and are kept. -#}
+      nodes, edges and install_log are deployment/audit metadata and are kept,
+      unless prune_manifests=true: then superseded manifest snapshots (not the
+      latest for their project x target) captured before the cutoff are
+      deleted with their nodes and edges. The latest snapshot is always kept. -#}
   {%- if not execute -%}{{ return('') }}{%- endif -%}
   {{ dbt_sentinel.sentinel_assert_adapter() }}
   {%- set k = keep_days | string | trim -%}
@@ -533,4 +536,28 @@ FROM (
       {% do log('dbt_sentinel purge: ' ~ t[0] ~ ' deleted ' ~ n ~ ' rows', info=true) %}
     {%- endif -%}
   {%- endfor -%}
+
+  {%- if prune_manifests -%}
+    {%- set superseded -%}
+SELECT x.snapshot_id
+FROM (
+    SELECT ms.snapshot_id, ms.captured_at_utc,
+           ROW_NUMBER() OVER (PARTITION BY ms.project_name, ms.target_name ORDER BY ms.captured_at_utc DESC) AS rn
+    FROM {{ dbt_sentinel.sentinel_rel('manifest_snapshots') }} AS ms
+) AS x
+WHERE x.rn > 1 AND x.captured_at_utc < {{ cutoff }}
+    {%- endset -%}
+    {%- set n = run_query('SELECT COUNT_BIG(*) AS n FROM (' ~ superseded ~ ') AS s').rows[0][0] -%}
+    {%- if dry_run -%}
+      {% do log('dbt_sentinel purge (dry run): ' ~ n ~ ' superseded manifest snapshots would be deleted', info=true) %}
+    {%- elif (n | int) > 0 -%}
+      {#- Nodes and edges first, header last: if the purge stops part-way, the
+          snapshot header still exists and the remaining rows can be purged on
+          the next run (never orphaned). -#}
+      {%- for t in ['manifest_edges', 'manifest_nodes', 'manifest_snapshots'] -%}
+        {% do run_query('DELETE FROM ' ~ dbt_sentinel.sentinel_rel(t) ~ ' WHERE [snapshot_id] IN (\n' ~ superseded ~ '\n)') %}
+      {%- endfor -%}
+      {% do log('dbt_sentinel purge: deleted ' ~ n ~ ' superseded manifest snapshots with their nodes and edges', info=true) %}
+    {%- endif -%}
+  {%- endif -%}
 {%- endmacro %}

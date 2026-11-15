@@ -1,4 +1,4 @@
-# dbt Sentinel 0.2.1
+# dbt Sentinel 0.2.2
 
 A custom, framework-only dbt package for **dbt Core 1.12.6 + dbt-synapse on Azure Synapse Dedicated SQL Pool**. It installs a `sentinel` (configurable) schema containing low-volume telemetry tables and dashboard-ready SQL views. No business/source tables are modified.
 
@@ -18,7 +18,7 @@ Each release is built as `dist/dbt_sentinel-<version>.zip` (with a `.sha256` che
 
 3. `dbt deps`, then continue from step 3 of the quick start below.
 
-For Azure DevOps builds, either commit the unzipped folder to the host repository (e.g. `packages/dbt_sentinel` with `local: "packages/dbt_sentinel"`) or publish the package to a private Git repo and pin the tag (`git:` + `revision: "0.2.1"`). A path on your own machine is not visible to build agents.
+For Azure DevOps builds, either commit the unzipped folder to the host repository (e.g. `packages/dbt_sentinel` with `local: "packages/dbt_sentinel"`) or publish the package to a private Git repo and pin the tag (`git:` + `revision: "0.2.2"`). A path on your own machine is not visible to build agents.
 
 ## Quick start
 
@@ -33,7 +33,7 @@ The short path from zero to a working dashboard. Sections 1-7 below have the det
      - local: "C:/dbt-sentinel"        # local development (or a relative path)
      # Azure DevOps agents cannot see a local drive - use a private repo and pin a tag:
      # - git: "https://dev.azure.com/<org>/<project>/_git/dbt_sentinel"
-     #   revision: "0.2.1"
+     #   revision: "0.2.2"
    ```
 
 3. **Add hooks and vars** to the host `dbt_project.yml`, merged with what is already there (see `examples/dbt_project_fragment.yml` for every option, e.g. `sentinel_view_reader_role`, `sentinel_summary_target`):
@@ -71,7 +71,7 @@ The short path from zero to a working dashboard. Sections 1-7 below have the det
    | Every 15 minutes | `dbt run-operation sentinel_sample_requests` (login-level query history) |
    | Daily | `dbt run-operation sentinel_sample_storage` |
    | Daily | `dbt run-operation sentinel_sample_table_health` |
-   | Weekly | `dbt run-operation sentinel_purge_history --args "{keep_days: 180}"` |
+   | Weekly | `dbt run-operation sentinel_purge_history --args "{keep_days: 180}"` (add `prune_manifests: true` to also drop superseded manifest snapshots; the latest per project × target is always kept) |
 
 7. **Report what dbt cannot see.** Add `sentinel_record_stage` calls (with an `always()` finaliser passing `$(Agent.JobStatus)`) and `scripts/freshness_to_sentinel.py` after `dbt source freshness` - see `examples/azure-pipelines-steps.yml`. Keep these steps `continueOnError: true` so dbt's exit code stays authoritative.
 
@@ -144,7 +144,9 @@ on-run-end:
 
 Passing `results` explicitly is recommended; `sentinel_capture_run()` with no argument falls back to the hook context's `results`. See `examples/dbt_project_fragment.yml` for every supported var. By default (`sentinel_hook_on_error: warn`) a telemetry write failure is logged as a `[WARNING]` line and does not fail the build; set it to `fail` to make telemetry mandatory. Warn mode also holds under `--warn-error` (Sentinel logs instead of raising a dbt warning) and on targets where Sentinel is not installed (the hooks check that their tables exist and skip with a log line). A lost database connection during the hook can still fail it, because dbt's Jinja cannot catch adapter exceptions. If node results cannot be fully written, the completion event is skipped, so the invocation shows as `missing_completion` instead of a complete run with missing nodes.
 
-Boolean vars (`sentinel_enabled`, `sentinel_capture_messages`, `sentinel_capture_query_text`, `sentinel_expose_command_text`, `sentinel_manifest_include_packages`) accept real booleans or the strings `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, so values from `env_var()` behave as expected; anything else is rejected.
+Boolean vars (`sentinel_enabled`, `sentinel_capture_messages`, `sentinel_capture_query_text`, `sentinel_expose_command_text`, `sentinel_manifest_include_packages`) accept real booleans or the strings `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`, so values from `env_var()` behave as expected; anything else is rejected. List vars (`sentinel_query_exclude_logins`, `sentinel_storage_exclude_schemas`, `sentinel_tracked_commands`, `sentinel_supported_adapters`) accept a YAML list or a comma-separated string.
+
+Before writing, Sentinel checks that the target table has every column this package version expects. After upgrading the package, run `sentinel_install` again: until you do, hooks skip their writes with a log line, and operations stop with a message telling you to run it.
 
 Execute from the host project's configured environment:
 

@@ -296,10 +296,19 @@ WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) 
   {%- if not execute -%}{{ return('') }}{%- endif -%}
   {{ dbt_sentinel.sentinel_assert_adapter() }}
   {%- set names = dbt_sentinel.sentinel_view_names() -%}
-  {#- Validate configuration and render every view before anything is dropped,
-      so a bad var cannot leave the views missing or without their grants. -#}
+  {#- Validate configuration (including that the reader role exists) and render
+      every view before anything is dropped, so a bad var cannot leave the views
+      missing or without their grants. A CREATE VIEW that fails on the server
+      (DDL cannot be rolled back here) still leaves later views missing; fix
+      the cause and re-run. -#}
   {%- set grantee = var('sentinel_view_reader_role', none) -%}
   {%- set grantee_sql = dbt_sentinel.sentinel_quote_name(grantee, 'sentinel_view_reader_role') if grantee else none -%}
+  {%- if grantee_sql -%}
+    {%- set found = run_query('SELECT COUNT(*) AS n FROM sys.database_principals WHERE name = ' ~ dbt_sentinel.sentinel_nstring(grantee | string | trim)) -%}
+    {%- if found is none or found.rows | length == 0 or (found.rows[0][0] | int) == 0 -%}
+      {{ exceptions.raise_compiler_error("dbt_sentinel: sentinel_view_reader_role '" ~ (grantee | string | trim) ~ "' does not exist in this database. Create it (or fix the name) first; no views were changed.") }}
+    {%- endif -%}
+  {%- endif -%}
   {%- set view_sql = {} -%}
   {%- for v in names -%}{%- do view_sql.update({v: dbt_sentinel.sentinel_view_sql(v)}) -%}{%- endfor -%}
   {#- Drop in reverse dependency order, create in dependency order. -#}
@@ -348,9 +357,12 @@ WHERE s.name = {{ dbt_sentinel.sentinel_nstring(dbt_sentinel.sentinel_schema()) 
       {%- do ns.missing.append(o) -%}
     {%- else -%}
       {#- Assign to a variable so the probe emits no result set of its own
-          (Synapse does not support SELECT @v = ..., hence SET). -#}
-      {%- set probe = 'DECLARE @sentinel_probe int;\nSET @sentinel_probe = (SELECT COUNT(*) FROM (SELECT TOP 1 1 AS x FROM ' ~ dbt_sentinel.sentinel_rel(o) ~ ') AS probe)' -%}
-      {%- if dbt_sentinel.sentinel_execute(probe, 'warn') -%}
+          (Synapse does not support SELECT @v = ..., hence SET). The probe runs
+          through sp_executesql so binding errors (a view whose base table or
+          column is gone) happen in a child scope, where TRY/CATCH can catch
+          them, and are reported instead of aborting the check. -#}
+      {%- set probe = "EXEC sp_executesql N'DECLARE @sentinel_probe int; SET @sentinel_probe = (SELECT COUNT(*) FROM (SELECT TOP 1 1 AS x FROM " ~ dbt_sentinel.sentinel_rel(o) ~ ") AS probe);'" -%}
+      {%- if dbt_sentinel.sentinel_execute(probe, 'warn', 'check of ' ~ o) -%}
         {% do log('dbt_sentinel check: ok   ' ~ o, info=true) %}
       {%- elif o in dmv_views -%}
         {%- do ns.warned.append(o) -%}
