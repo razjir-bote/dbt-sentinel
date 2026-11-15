@@ -395,6 +395,10 @@ def _spans(sql, opener_re):
     return spans
 
 
+# learn.microsoft.com/sql/t-sql/language-elements/reserved-keywords-transact-sql
+TSQL_RESERVED = set("""ADD ALL ALTER AND ANY AS ASC AUTHORIZATION BACKUP BEGIN BETWEEN BREAK BROWSE BULK BY CASCADE CASE CHECK CHECKPOINT CLOSE CLUSTERED COALESCE COLLATE COLUMN COMMIT COMPUTE CONSTRAINT CONTAINS CONTAINSTABLE CONTINUE CONVERT CREATE CROSS CURRENT CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR DATABASE DBCC DEALLOCATE DECLARE DEFAULT DELETE DENY DESC DISK DISTINCT DISTRIBUTED DOUBLE DROP DUMP ELSE END ERRLVL ESCAPE EXCEPT EXEC EXECUTE EXISTS EXIT EXTERNAL FETCH FILE FILLFACTOR FOR FOREIGN FREETEXT FREETEXTTABLE FROM FULL FUNCTION GOTO GRANT GROUP HAVING HOLDLOCK IDENTITY IDENTITY_INSERT IDENTITYCOL IF IN INDEX INNER INSERT INTERSECT INTO IS JOIN KEY KILL LABEL LEFT LIKE LINENO LOAD MERGE NATIONAL NOCHECK NONCLUSTERED NOT NULL NULLIF OF OFF OFFSETS ON OPEN OPENDATASOURCE OPENQUERY OPENROWSET OPENXML OPTION OR ORDER OUTER OVER PERCENT PIVOT PLAN PRECISION PRIMARY PRINT PROC PROCEDURE PUBLIC RAISERROR READ READTEXT RECONFIGURE REFERENCES REPLICATION RESTORE RESTRICT RETURN REVERT REVOKE RIGHT ROLLBACK ROWCOUNT ROWGUIDCOL RULE SAVE SCHEMA SECURITYAUDIT SELECT SEMANTICKEYPHRASETABLE SEMANTICSIMILARITYDETAILSTABLE SEMANTICSIMILARITYTABLE SESSION_USER SET SETUSER SHUTDOWN SOME STATISTICS SYSTEM_USER TABLE TABLESAMPLE TEXTSIZE THEN TO TOP TRAN TRANSACTION TRIGGER TRUNCATE TRY_CONVERT TSEQUAL UNION UNIQUE UNPIVOT UPDATE UPDATETEXT USE USER VALUES VARYING VIEW WAITFOR WHEN WHERE WHILE WITH WITHIN WRITETEXT""".split())
+
+
 def dialect_problems(sql):
     problems = []
     up = re.sub(r"N?'(?:[^']|'')*'", "''", sql).upper()  # blank out literals
@@ -412,11 +416,14 @@ def dialect_problems(sql):
         problems.append("SELECT @var = (unsupported in Dedicated SQL Pool)")
     if re.search(r"\bMERGE\b", up):
         problems.append("MERGE")
-    # Words the Dedicated SQL Pool parser rejects after a dot unless bracketed
-    # (e.g. r.importance -> "Incorrect syntax near '.'"); write alias.[word].
-    for word in ("IMPORTANCE", "LABEL"):
-        if re.search(r"\w\." + word + r"\b", up):
-            problems.append("unquoted ." + word.lower() + " (use .[" + word.lower() + "])")
+    # Reserved words (SQL Server + Synapse-only LABEL) used as column names
+    # must be delimited: r.label fails to parse, r.[label] works.
+    for m in re.finditer(r"\w\.([A-Z_]+)\b", up):
+        if m.group(1) in TSQL_RESERVED:
+            problems.append("unquoted reserved word ." + m.group(1).lower() + " (use .[" + m.group(1).lower() + "])")
+    for m in re.finditer(r"\bAS[ \t]+([A-Z_]+)[ \t]*(?=,|\)|$)", up, re.M):
+        if m.group(1) in TSQL_RESERVED:
+            problems.append("reserved word used as alias: AS " + m.group(1).lower())
     if up.lstrip().startswith("CREATE VIEW"):
         if re.search(r"\bAS\s*\n\s*WITH\b", up):
             problems.append("CTE in view")
