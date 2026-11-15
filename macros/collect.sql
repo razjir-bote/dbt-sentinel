@@ -380,7 +380,7 @@ INSERT INTO {{ dbt_sentinel.sentinel_rel('query_samples') }}
 SELECT
     SYSUTCDATETIME(), q.request_id, q.session_id, q.login_name, q.app_name, q.status,
     q.submit_time_utc, q.start_time_utc, q.end_time_utc, q.total_elapsed_ms, q.queue_ms,
-    q.statement_type, q.label, q.resource_class, q.importance, q.group_name, q.error_id,
+    q.statement_type, q.label, q.resource_class, q.[importance], q.group_name, q.error_id,
     q.result_cache_hit, q.command_text
 FROM (
 {{ dbt_sentinel.sentinel__requests_select(finished_only=true) }}

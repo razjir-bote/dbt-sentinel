@@ -346,7 +346,7 @@ def check_layout():
         R.ok((ROOT / f).exists(), f"exists: {f}")
     proj = (ROOT / "dbt_project.yml").read_text(encoding="utf-8")
     R.ok("name: dbt_sentinel" in proj, "dbt_project.yml name is dbt_sentinel")
-    R.ok('version: "0.2.2"' in proj, "dbt_project.yml version 0.2.2")
+    R.ok('version: "0.2.3"' in proj, "dbt_project.yml version 0.2.3")
     R.ok('macro-paths: ["macros"]' in proj, "macro-paths configured")
 
 
@@ -412,6 +412,11 @@ def dialect_problems(sql):
         problems.append("SELECT @var = (unsupported in Dedicated SQL Pool)")
     if re.search(r"\bMERGE\b", up):
         problems.append("MERGE")
+    # Words the Dedicated SQL Pool parser rejects after a dot unless bracketed
+    # (e.g. r.importance -> "Incorrect syntax near '.'"); write alias.[word].
+    for word in ("IMPORTANCE",):
+        if re.search(r"\w\." + word + r"\b", up):
+            problems.append("unquoted ." + word.lower() + " (use .[" + word.lower() + "])")
     if up.lstrip().startswith("CREATE VIEW"):
         if re.search(r"\bAS\s*\n\s*WITH\b", up):
             problems.append("CTE in view")

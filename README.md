@@ -1,4 +1,4 @@
-# dbt Sentinel 0.2.2
+# dbt Sentinel 0.2.3
 
 A custom, framework-only dbt package for **dbt Core 1.12.6 + dbt-synapse on Azure Synapse Dedicated SQL Pool**. It installs a `sentinel` (configurable) schema containing low-volume telemetry tables and dashboard-ready SQL views. No business/source tables are modified.
 
@@ -18,7 +18,7 @@ Each release is built as `dist/dbt_sentinel-<version>.zip` (with a `.sha256` che
 
 3. `dbt deps`, then continue from step 3 of the quick start below.
 
-For Azure DevOps builds, either commit the unzipped folder to the host repository (e.g. `packages/dbt_sentinel` with `local: "packages/dbt_sentinel"`) or publish the package to a private Git repo and pin the tag (`git:` + `revision: "0.2.2"`). A path on your own machine is not visible to build agents.
+For Azure DevOps builds, either commit the unzipped folder to the host repository (e.g. `packages/dbt_sentinel` with `local: "packages/dbt_sentinel"`) or publish the package to a private Git repo and pin the tag (`git:` + `revision: "0.2.3"`). A path on your own machine is not visible to build agents.
 
 ## Quick start
 
@@ -33,7 +33,7 @@ The short path from zero to a working dashboard. Sections 1-7 below have the det
      - local: "C:/dbt-sentinel"        # local development (or a relative path)
      # Azure DevOps agents cannot see a local drive - use a private repo and pin a tag:
      # - git: "https://dev.azure.com/<org>/<project>/_git/dbt_sentinel"
-     #   revision: "0.2.2"
+     #   revision: "0.2.3"
    ```
 
 3. **Add hooks and vars** to the host `dbt_project.yml`, merged with what is already there (see `examples/dbt_project_fragment.yml` for every option, e.g. `sentinel_view_reader_role`, `sentinel_summary_target`):
