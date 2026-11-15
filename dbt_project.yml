@@ -1,0 +1,29 @@
+name: dbt_sentinel
+version: "0.2.0"
+config-version: 2
+
+# Framework-only package: macros that install and feed a telemetry schema.
+# Target: dbt Core 1.12.x + dbt-synapse on Azure Synapse Dedicated SQL Pool.
+require-dbt-version: [">=1.8.0", "<2.0.0"]
+
+macro-paths: ["macros"]
+
+# The package ships no models, seeds, snapshots or dbt tests. These paths are
+# pointed at folders that do not exist so that tooling in the repository
+# (tests/check_package.py, integration_tests/) is never parsed as dbt resources.
+model-paths: ["models"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+analysis-paths: ["analyses"]
+test-paths: ["data_tests"]
+
+clean-targets: ["target", "dbt_packages"]
+
+# Defaults. Override in the host project's dbt_project.yml `vars:` block.
+vars:
+  sentinel_schema: sentinel
+  sentinel_enabled: true
+  sentinel_batch_size: 35
+  sentinel_run_stale_hours: 26
+  sentinel_missing_completion_minutes: 120
+  sentinel_model_slowdown_factor: 2.0

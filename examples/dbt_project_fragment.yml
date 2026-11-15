@@ -1,0 +1,53 @@
+# Merge into the HOST project's dbt_project.yml. Do not replace existing
+# vars or hooks - append the two hook entries to any you already have.
+
+vars:
+  # --- core -----------------------------------------------------------------
+  sentinel_schema: sentinel              # telemetry schema (simple identifier)
+  sentinel_enabled: true                 # false disables both hooks
+  sentinel_batch_size: 35                # rows per INSERT ... SELECT UNION ALL batch
+  sentinel_hook_on_error: warn           # warn = log and continue; fail = fail the dbt job
+  # sentinel_operation_on_error: fail    # run-operations fail loudly by default
+  # sentinel_tracked_commands: [build, run, test, seed, snapshot]
+
+  # --- view thresholds (rendered into views: redeploy after changing) -------
+  sentinel_run_stale_hours: 26           # no successful run for this long => stale
+  sentinel_missing_completion_minutes: 120
+  sentinel_model_slowdown_factor: 2.0    # anomaly if runtime >= factor x 10-run mean
+  # sentinel_anomaly_min_baseline_runs: 5
+  # sentinel_anomaly_min_delta_seconds: 30
+  # sentinel_test_failure_days: 30
+  # sentinel_freshness_check_stale_hours: 26
+  # sentinel_stage_stale_hours: 26
+  # sentinel_summary_target: prod        # restrict v_health_summary to one target
+
+  # --- table health (v_table_skew / v_columnstore_health / v_table_statistics)
+  # sentinel_skew_threshold_pct: 10      # skew % = 100 x (1 - avg/max rows per distribution)
+  # sentinel_skew_min_rows: 1000000
+  # sentinel_cci_min_table_rows: 6000000
+  # sentinel_cci_min_avg_rows: 100000
+  # sentinel_cci_small_rowgroup_rows: 100000
+  # sentinel_cci_max_delta_pct: 10
+  # sentinel_cci_max_deleted_pct: 10
+  # sentinel_stats_max_diff_pct: 20      # optimizer vs actual row count
+  # sentinel_stats_min_rows: 1000
+
+  # --- capture and privacy --------------------------------------------------
+  # sentinel_capture_messages: true      # store (truncated) dbt result messages
+  # sentinel_message_max_length: 1000
+  # sentinel_expose_command_text: false  # true adds 200-char SQL preview to v_warehouse_requests
+  # sentinel_capture_query_text: false  # true stores SQL text in query_samples / v_user_queries
+  # sentinel_query_text_max_length: 1000
+  # sentinel_query_exclude_logins: [svc_powerbi]   # 'System' is always excluded
+  # sentinel_manifest_include_packages: false
+  # sentinel_storage_exclude_schemas: [sentinel]
+
+  # --- deployment -----------------------------------------------------------
+  # sentinel_table_index: HEAP           # or 'CLUSTERED COLUMNSTORE INDEX'
+  # sentinel_schema_owner: <role/user>   # CREATE SCHEMA ... AUTHORIZATION
+  # sentinel_view_reader_role: powerbi_readers   # re-granted SELECT on every view deploy
+
+on-run-start:
+  - "{{ dbt_sentinel.sentinel_start_run() }}"
+on-run-end:
+  - "{{ dbt_sentinel.sentinel_capture_run(results) }}"

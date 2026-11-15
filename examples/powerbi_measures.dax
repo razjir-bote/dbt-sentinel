@@ -1,0 +1,103 @@
+// dbt Sentinel - example Power BI measures.
+// Import the Sentinel views (not the tables) with the same names, e.g.
+// 'v_run_history', 'v_node_history', 'v_operational_alerts'. All times are UTC.
+// Recommended: Import mode with scheduled refresh. Keep the DMV views
+// (v_warehouse_requests, v_warehouse_waits, v_warehouse_pressure, v_table_storage)
+// in a separate, less frequently refreshed dataset or use the sampled tables.
+
+// ---------------------------------------------------------------- Command centre
+Overall State = MAX ( 'v_health_summary'[overall_state] )   // v_health_summary has one row
+
+Runs (24h) = SUM ( 'v_health_summary'[runs_24h] )
+
+Run Success Rate (24h) = MAX ( 'v_health_summary'[success_rate_24h] )
+
+High Alerts = COUNTROWS ( FILTER ( 'v_operational_alerts', 'v_operational_alerts'[severity] = "high" ) )
+
+Open Test Failures (24h) =
+    COUNTROWS ( FILTER ( 'v_operational_alerts', 'v_operational_alerts'[alert_type] = "test_failure" ) )
+
+Last Completed Run (UTC) = MAX ( 'v_run_history'[completed_at_utc] )
+
+Hours Since Last Success =
+    VAR lastOk = CALCULATE ( MAX ( 'v_run_history'[completed_at_utc] ),
+                             'v_run_history'[run_status] IN { "success", "warn" } )
+    RETURN IF ( ISBLANK ( lastOk ), BLANK (), DATEDIFF ( lastOk, UTCNOW (), MINUTE ) / 60 )
+
+// Never show green on an absent signal: surface coverage explicitly.
+Signal Coverage =
+    SUMX ( 'v_health_summary',
+           'v_health_summary'[has_run_signal] + 'v_health_summary'[has_stage_signal]
+         + 'v_health_summary'[has_freshness_signal] + 'v_health_summary'[has_warehouse_signal]
+         + 'v_health_summary'[has_manifest_signal] ) / 5
+
+Missing Completions (24h) = SUM ( 'v_pipeline_health'[missing_completions_24h] )
+
+// ---------------------------------------------------------------- dbt performance
+Avg Model Runtime (s) =
+    CALCULATE ( AVERAGE ( 'v_node_history'[execution_seconds] ),
+                'v_node_history'[resource_type] = "model",
+                'v_node_history'[status] = "success" )
+
+P95 Model Runtime (s) =
+    CALCULATE ( PERCENTILE.INC ( 'v_node_history'[execution_seconds], 0.95 ),
+                'v_node_history'[resource_type] = "model",
+                'v_node_history'[status] = "success" )
+
+Duration Anomalies = SUM ( 'v_duration_anomalies'[is_anomaly] )
+
+Worst Slowdown Ratio =
+    CALCULATE ( MAX ( 'v_duration_anomalies'[slowdown_ratio] ), 'v_duration_anomalies'[is_anomaly] = 1 )
+
+// ---------------------------------------------------------------- Data quality / governance
+Test Pass Rate =
+    VAR tests = FILTER ( 'v_node_history', 'v_node_history'[resource_type] = "test" )
+    RETURN DIVIDE ( COUNTROWS ( FILTER ( tests, 'v_node_history'[status] = "pass" ) ), COUNTROWS ( tests ) )
+
+Models Without Owner = CALCULATE ( COUNTROWS ( 'v_test_coverage' ),
+                                   'v_test_coverage'[resource_type] = "model", 'v_test_coverage'[has_owner] = 0 )
+
+Models Without Tests = CALCULATE ( COUNTROWS ( 'v_test_coverage' ),
+                                   'v_test_coverage'[resource_type] = "model", 'v_test_coverage'[has_tests] = 0 )
+
+Test Coverage % =
+    DIVIDE ( CALCULATE ( COUNTROWS ( 'v_test_coverage' ), 'v_test_coverage'[resource_type] = "model", 'v_test_coverage'[has_tests] = 1 ),
+             CALCULATE ( COUNTROWS ( 'v_test_coverage' ), 'v_test_coverage'[resource_type] = "model" ) )
+
+Sources Not Recently Checked =
+    COUNTROWS ( FILTER ( 'v_source_freshness', 'v_source_freshness'[freshness_state] IN { "not_checked", "check_stale" } ) )
+
+// ---------------------------------------------------------------- Platform
+Peak Suspended Requests = MAX ( 'v_warehouse_history'[suspended_requests] )
+
+Failed SQL Requests (sampled) = SUM ( 'v_warehouse_history'[failed_requests_15m] )
+
+Avg Queue (ms) - current = AVERAGE ( 'v_warehouse_requests'[queue_ms] )
+
+Table Rows Added (period) = SUM ( 'v_table_growth'[row_delta] )
+
+Reserved GB = DIVIDE ( SUM ( 'v_table_storage'[reserved_mb] ), 1024 )
+
+Tables Needing Maintenance =
+    CALCULATE ( COUNTROWS ( 'v_table_health_history' ),
+                'v_table_health_history'[is_latest] = 1, 'v_table_health_history'[issue_count] > 0 )
+
+Skewed Tables = CALCULATE ( COUNTROWS ( 'v_table_health_history' ),
+                            'v_table_health_history'[is_latest] = 1, 'v_table_health_history'[is_skewed] = 1 )
+
+Stale Statistics Tables = CALCULATE ( COUNTROWS ( 'v_table_health_history' ),
+                                      'v_table_health_history'[is_latest] = 1, 'v_table_health_history'[is_stale_stats] = 1 )
+
+// ---------------------------------------------------------------- User activity
+Queries Run = COUNTROWS ( 'v_query_history' )
+
+Active Users = DISTINCTCOUNT ( 'v_query_history'[login_name] )
+
+User Query Failure Rate = DIVIDE ( SUM ( 'v_query_history'[is_failed] ), COUNTROWS ( 'v_query_history' ) )
+
+Avg Query Duration (s) = AVERAGE ( 'v_query_history'[elapsed_seconds] )
+
+// ---------------------------------------------------------------- Pipeline flow
+Failed Stages = COUNTROWS ( FILTER ( 'v_stage_health', 'v_stage_health'[health_state] = "unhealthy" ) )
+
+Rows Loaded (latest) = SUM ( 'v_stage_health'[rows_loaded] )

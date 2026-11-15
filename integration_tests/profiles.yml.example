@@ -1,0 +1,17 @@
+# Copy to ~/.dbt/profiles.yml (or set DBT_PROFILES_DIR) and fill in. Use a
+# DEVELOPMENT pool and the same authentication method as production.
+sentinel_integration_tests:
+  target: dev
+  outputs:
+    dev:
+      type: synapse
+      driver: "ODBC Driver 18 for SQL Server"
+      host: "<workspace>.sql.azuresynapse.net"
+      port: 1433
+      database: "<dedicated_pool_db>"
+      schema: dbo
+      authentication: CLI            # or ServicePrincipal / ActiveDirectoryInteractive
+      # tenant_id / client_id / client_secret for ServicePrincipal (use env_var())
+      encrypt: true
+      trust_cert: false
+      threads: 4

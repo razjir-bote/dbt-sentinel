@@ -1,0 +1,27 @@
+# Minimal host project for acceptance-testing dbt Sentinel against a
+# DEVELOPMENT Dedicated SQL Pool. See integration_tests/README.md.
+name: sentinel_integration_tests
+version: "0.1.0"
+config-version: 2
+profile: sentinel_integration_tests
+
+model-paths: ["models"]
+test-paths: ["tests"]
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  sentinel_integration_tests:
+    +materialized: view
+    +schema: sentinel_it
+
+vars:
+  sentinel_schema: sentinel_it_telemetry
+  sentinel_batch_size: 35
+  sentinel_hook_on_error: fail          # fail loudly while acceptance testing
+  sentinel_missing_completion_minutes: 1 # makes the interrupted-build test quick
+  sentinel_it_force_failure: false
+
+on-run-start:
+  - "{{ dbt_sentinel.sentinel_start_run() }}"
+on-run-end:
+  - "{{ dbt_sentinel.sentinel_capture_run(results) }}"

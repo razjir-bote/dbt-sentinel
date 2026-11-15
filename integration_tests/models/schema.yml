@@ -1,0 +1,28 @@
+version: 2
+
+sources:
+  - name: sentinel_it_src
+    # The Sentinel install log is a real table once sentinel_install has run,
+    # which gives the acceptance test a source with a freshness policy.
+    schema: "{{ var('sentinel_schema') }}"
+    tables:
+      - name: install_log
+        description: Sentinel installation records (used as a test source).
+        loaded_at_field: installed_at_utc
+        freshness:
+          warn_after: {count: 7, period: day}
+        config:
+          meta:
+            owner: data-ops
+
+models:
+  - name: sentinel_it_passing
+    description: Always-passing model for Sentinel acceptance tests.
+    config:
+      meta:
+        owner: data-ops
+    columns:
+      - name: id
+        data_tests:
+          - not_null
+          - unique

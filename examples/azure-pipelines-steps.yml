@@ -1,0 +1,76 @@
+# Example Azure DevOps steps for a TDI job that runs dbt with Sentinel.
+# Azure DevOps exposes predefined variables (BUILD_BUILDID, BUILD_SOURCEVERSION,
+# BUILD_DEFINITIONNAME, BUILD_SOURCEBRANCH, BUILD_REASON) to scripts as
+# environment variables; Sentinel's hooks read them automatically.
+#
+# Principles:
+#   * The dbt step's exit code is authoritative for the job result.
+#   * Telemetry steps use continueOnError so they can never mask or replace it.
+#   * The finaliser runs under always(), so a failed or cancelled job is still
+#     recorded even when dbt never reached its on-run-end hook.
+
+steps:
+  - script: dbt deps
+    displayName: dbt deps
+
+  # One-off / per release (manifest changes): uncomment in the deployment pipeline.
+  # - script: |
+  #     dbt run-operation sentinel_install
+  #     dbt run-operation sentinel_sync_manifest
+  #     dbt run-operation sentinel_check
+  #   displayName: Sentinel install + manifest sync
+
+  - script: >
+      dbt run-operation sentinel_record_stage --args
+      "{pipeline_name: '$(Build.DefinitionName)', pipeline_run_id: '$(Build.BuildId)', stage: 'silver_gold', status: 'running'}"
+    displayName: Sentinel - stage started
+    continueOnError: true
+
+  - script: dbt build --target prod
+    displayName: dbt build
+    name: dbt_build
+
+  - script: dbt source freshness --target prod
+    displayName: dbt source freshness
+    condition: succeededOrFailed()
+    continueOnError: true
+
+  - script: python dbt_packages/dbt_sentinel/scripts/freshness_to_sentinel.py target/sources.json --execute
+    displayName: Sentinel - record source freshness
+    condition: succeededOrFailed()
+    continueOnError: true
+
+  # Finaliser. Agent.JobStatus is one of Succeeded, SucceededWithIssues,
+  # Failed, Canceled; Sentinel normalises these.
+  - script: >
+      dbt run-operation sentinel_record_stage --args
+      "{pipeline_name: '$(Build.DefinitionName)', pipeline_run_id: '$(Build.BuildId)', stage: 'silver_gold', status: '$(Agent.JobStatus)'}"
+    displayName: Sentinel - stage finaliser
+    condition: always()
+    continueOnError: true
+
+  # Keep artifacts as a recovery source if telemetry writes fail.
+  - task: PublishPipelineArtifact@1
+    displayName: Publish dbt artifacts
+    condition: always()
+    continueOnError: true
+    inputs:
+      targetPath: target
+      artifact: dbt-artifacts-$(System.JobAttempt)
+
+# Separate scheduled pipeline (e.g. cron every 15 minutes) for warehouse samples:
+#
+# schedules:
+#   - cron: "*/15 * * * *"
+#     branches: { include: [main] }
+#     always: true
+# steps:
+#   - script: dbt deps && dbt run-operation sentinel_sample_warehouse && dbt run-operation sentinel_sample_requests
+#   # daily:
+#   - script: dbt run-operation sentinel_sample_storage && dbt run-operation sentinel_sample_table_health
+#   # weekly:
+#   - script: dbt run-operation sentinel_purge_history --args '{keep_days: 180}'
+#
+# Spark / Bronze notebooks or Synapse pipeline activities can report their own
+# stage through any step that can run dbt, for example:
+#   dbt run-operation sentinel_record_stage --args "{pipeline_name: 'TDI', pipeline_run_id: '1234', stage: 'bronze', source_name: 'ABR', status: 'success', rows_loaded: 100000}"
