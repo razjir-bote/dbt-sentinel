@@ -4,7 +4,8 @@
 
 Fixes `sentinel_install` failing on Azure Synapse dedicated SQL pools with `Parse error ... Incorrect syntax near '.'` while creating `v_warehouse_requests`. No table changes; re-run `dbt run-operation sentinel_install` to recreate the views.
 
-- `IMPORTANCE` is a reserved word in the dedicated pool parser, so `alias.importance` is now bracket-quoted (`alias.[importance]`) in `v_warehouse_requests`, `v_user_queries`, `v_query_history`, the shared requests query and the `query_samples` collection insert. Column names in the views are unchanged.
+- `LABEL` and `IMPORTANCE` are keywords in the dedicated pool parser, so `alias.label` and `alias.importance` are now bracket-quoted (`alias.[label]`, `alias.[importance]`) in `v_warehouse_requests`, `v_warehouse_waits`, `v_user_queries`, `v_query_history`, the shared requests query and the `query_samples` collection insert. Column names in the views are unchanged.
+- `tests/check_package.py` flags these columns if they are written without brackets.
 
 ## 0.2.2 - 2026-11-15
 

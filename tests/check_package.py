@@ -414,7 +414,7 @@ def dialect_problems(sql):
         problems.append("MERGE")
     # Words the Dedicated SQL Pool parser rejects after a dot unless bracketed
     # (e.g. r.importance -> "Incorrect syntax near '.'"); write alias.[word].
-    for word in ("IMPORTANCE",):
+    for word in ("IMPORTANCE", "LABEL"):
         if re.search(r"\w\." + word + r"\b", up):
             problems.append("unquoted ." + word.lower() + " (use .[" + word.lower() + "])")
     if up.lstrip().startswith("CREATE VIEW"):
