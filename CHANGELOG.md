@@ -6,6 +6,7 @@ Fixes `sentinel_install` failing on Azure Synapse dedicated SQL pools with `Pars
 
 - `LABEL` and `IMPORTANCE` are keywords in the dedicated pool parser, so `alias.label` and `alias.importance` are now bracket-quoted (`alias.[label]`, `alias.[importance]`) in `v_warehouse_requests`, `v_warehouse_waits`, `v_user_queries`, `v_query_history`, the shared requests query and the `query_samples` collection insert. Column names in the views are unchanged.
 - `tests/check_package.py` flags these columns if they are written without brackets.
+- The integration test model `sentinel_it_passing` no longer names a column `label`, which made `dbt build` fail with `Incorrect syntax near 'as'`.
 
 ## 0.2.2 - 2026-11-15
 
