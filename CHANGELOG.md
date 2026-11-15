@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 - 2026-11-15
+
+Fixes `sentinel_install` failing on Azure Synapse dedicated SQL pools with `Parse error ... Incorrect syntax near '.'` while creating `v_warehouse_requests`. No table changes; re-run `dbt run-operation sentinel_install` to recreate the views.
+
+- `IMPORTANCE` is a reserved word in the dedicated pool parser, so `alias.importance` is now bracket-quoted (`alias.[importance]`) in `v_warehouse_requests`, `v_user_queries`, `v_query_history`, the shared requests query and the `query_samples` collection insert. Column names in the views are unchanged.
+
 ## 0.2.2 - 2026-11-15
 
 Fixes from a second code review. No table changes; run `dbt run-operation sentinel_deploy_views` (or `sentinel_install`) to pick up the view changes.

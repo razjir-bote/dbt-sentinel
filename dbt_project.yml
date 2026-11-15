@@ -1,5 +1,5 @@
 name: dbt_sentinel
-version: "0.2.2"
+version: "0.2.3"
 config-version: 2
 
 # Framework-only package: macros that install and feed a telemetry schema.
